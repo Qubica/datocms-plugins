@@ -50,7 +50,7 @@ export interface SeoObject {
  * @param toLocale - Target locale code for translation
  * @param fromLocale - Source locale code for translation
  * @param provider - TranslationProvider instance
- * @param fieldTypePrompt - Additional prompt for SEO format instructions
+ * @param _fieldTypePrompt - Unused, kept for signature parity with other field translators
  * @param _streamCallbacks - Optional callbacks for streaming updates
  * @param recordContext - Optional context about the record being translated
  * @returns The translated SEO object
@@ -61,7 +61,7 @@ export async function translateSeoFieldValue(
   toLocale: string,
   fromLocale: string,
   provider: TranslationProvider,
-  fieldTypePrompt: string,
+  _fieldTypePrompt: string,
   _streamCallbacks?: StreamCallbacks,
   recordContext = '',
 ): Promise<SeoObject> {
@@ -91,25 +91,6 @@ export async function translateSeoFieldValue(
     const toLocaleName = locale.getByTag(toLocale)?.name || toLocale;
 
     logger.info(`Translating from ${fromLocaleName} to ${toLocaleName}`);
-
-    // Base prompt with replaceable placeholders
-    const prompt = (pluginParams.prompt || '')
-      .replace(
-        '{fieldValue}',
-        JSON.stringify({ title: sourceTitle, description: sourceDescription }),
-      )
-      .replace('{fromLocale}', fromLocaleName)
-      .replace('{toLocale}', toLocaleName)
-      .replace(
-        '{recordContext}',
-        recordContext || 'Record context: No additional context available.',
-      );
-
-    // Using template literal as per linting rules
-    const formattedPrompt = `${prompt}\n${fieldTypePrompt}`;
-    logger.info('Formatted prompt prepared for translation');
-    // Log prompt only when debugging is enabled
-    logger.logPrompt('SEO translation prompt', formattedPrompt);
 
     // Translate via array helper for parity across vendors
     const [titleT, descT] = await translateArray(
