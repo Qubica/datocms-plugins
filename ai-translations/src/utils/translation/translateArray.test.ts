@@ -238,6 +238,176 @@ describe('translateArray.ts', () => {
         expect(result).toEqual(['Hallo', 'Welt']);
       });
 
+      it.each([1, 26])(
+        'should apply the configured prompt and context to every request for %i segments',
+        async (segmentCount) => {
+          const segments = Array.from(
+            { length: segmentCount },
+            (_, index) => `Hello {{name_${index}}} ${index}`,
+          );
+          const protectedSegments = segments.map(
+            (_, index) => `Hello ⟦PH_0⟧ ${index}`,
+          );
+          const translatedSegments = segments.map(
+            (_, index) => `Hallo ⟦PH_0⟧ ${index}`,
+          );
+          const expectedChunks =
+            segmentCount === 1
+              ? [protectedSegments]
+              : [protectedSegments.slice(0, 25), protectedSegments.slice(25)];
+          const completeText = vi.mocked(mockProvider.completeText);
+          completeText.mockResolvedValueOnce(
+            JSON.stringify(translatedSegments.slice(0, 25)),
+          );
+          if (segmentCount > 25) {
+            completeText.mockResolvedValueOnce(
+              JSON.stringify(translatedSegments.slice(25)),
+            );
+          }
+
+          const result = await translateArray(
+            mockProvider,
+            {
+              ...mockPluginParams,
+              prompt: `Use a formal tone. Keep ACME unchanged.
+Sources: {fromLocale} / {fromLocale}.
+Targets: {toLocale} / {toLocale}.
+Contexts: [{recordContext}] / [{recordContext}].
+Content: {fieldValue} / {fieldValue}.`,
+            },
+            segments,
+            'en',
+            'de',
+            { recordContext: 'Product description' },
+          );
+
+          expect(completeText).toHaveBeenCalledTimes(expectedChunks.length);
+          for (const [index, chunk] of expectedChunks.entries()) {
+            const prompt = completeText.mock.calls[index][0];
+            expect(prompt).toContain(`Use a formal tone. Keep ACME unchanged.
+Sources: en / en.
+Targets: de / de.
+Contexts: [Product description] / [Product description].
+Content: (see the JSON array below) / (see the JSON array below).`);
+            expect(prompt).toContain('Return ONLY a valid JSON array of strings');
+            expect(prompt).toContain('strict one-to-one mapping');
+            expect(prompt).toContain('Preserve tokens like ⟦PH_0⟧ exactly');
+            expect(prompt.endsWith(`\n${JSON.stringify(chunk)}`)).toBe(true);
+          }
+          expect(result).toEqual(
+            segments.map((_, index) => `Hallo {{name_${index}}} ${index}`),
+          );
+        },
+      );
+
+      it('should retain mandatory ICU rules with a custom prompt', async () => {
+        const segment =
+          '{gender, select, male {He said} female {She said} other {They said}}';
+        vi.mocked(mockProvider.completeText).mockResolvedValue(
+          JSON.stringify([segment]),
+        );
+
+        await translateArray(
+          mockProvider,
+          {
+            ...mockPluginParams,
+            prompt: 'Translate {fieldValue} from {fromLocale} to {toLocale}.',
+          },
+          [segment],
+          'en',
+          'de',
+        );
+
+        const prompt = vi.mocked(mockProvider.completeText).mock.calls[0][0];
+        expect(prompt).toContain('ICU Message Format');
+        expect(prompt).toContain(
+          'You MUST preserve the structure, keywords, and variable keys exactly.',
+        );
+        expect(prompt).toContain(
+          'ONLY translate the human-readable content inside the brackets.',
+        );
+        expect(prompt.endsWith(`\n${JSON.stringify([segment])}`)).toBe(true);
+      });
+
+      it('should retain selected locales when the custom prompt omits locale placeholders', async () => {
+        vi.mocked(mockProvider.completeText).mockResolvedValue('["Olá"]');
+
+        await translateArray(
+          mockProvider,
+          {
+            ...mockPluginParams,
+            prompt: 'Use a formal tone. Keep ACME unchanged.',
+          },
+          ['Hello'],
+          'en-GB',
+          'pt-BR',
+        );
+
+        const prompt = vi.mocked(mockProvider.completeText).mock.calls[0][0];
+        expect(prompt).toContain('Use a formal tone. Keep ACME unchanged.');
+        expect(prompt).toContain(
+          'Translate the following array of strings from en-GB to pt-BR.',
+        );
+      });
+
+      it.each([
+        '$$',
+        '$&',
+        "$'",
+        '$`',
+        '{fromLocale}',
+        '{toLocale}',
+        '{fieldValue}',
+        '{recordContext}',
+      ])('should insert context containing %s literally', async (literal) => {
+        vi.mocked(mockProvider.completeText).mockResolvedValue('["Hallo"]');
+        const recordContext = `Literal content: ${literal}.`;
+
+        await translateArray(
+          mockProvider,
+          {
+            ...mockPluginParams,
+            prompt:
+              'Context: {recordContext}; translate {fieldValue} from {fromLocale} to {toLocale}.',
+          },
+          ['Hello'],
+          'en',
+          'de',
+          { recordContext },
+        );
+
+        const prompt = vi.mocked(mockProvider.completeText).mock.calls[0][0];
+        expect(
+          prompt.startsWith(
+            `Context: ${recordContext}; translate (see the JSON array below) from en to de.`,
+          ),
+        ).toBe(true);
+      });
+
+      it('should use the default prompt and context fallback when none are configured', async () => {
+        vi.mocked(mockProvider.completeText).mockResolvedValue('["Hallo"]');
+
+        await translateArray(
+          mockProvider,
+          mockPluginParams,
+          ['Hello'],
+          'en',
+          'de',
+        );
+
+        const prompt = vi.mocked(mockProvider.completeText).mock.calls[0][0];
+        expect(prompt).toContain(
+          'You are an expert translator specializing in CMS content translation.',
+        );
+        expect(prompt).toContain('No additional context available.');
+        expect(prompt).toContain(
+          'Translate the following content from en to de:',
+        );
+        expect(prompt).not.toMatch(
+          /\{(?:fromLocale|toLocale|fieldValue|recordContext)\}/,
+        );
+      });
+
       it('should rejoin when the model splits a single HTML segment into multiple elements', async () => {
         // Regression (Basecamp card 10026091779): a WYSIWYG/rich-text field is
         // sent as ONE segment containing several block-level <p> elements. Chat

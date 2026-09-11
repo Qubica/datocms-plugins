@@ -442,17 +442,24 @@ function buildChatInstruction(
   recordContext: string,
 ): string {
   const template = pluginParams.prompt || defaultPrompt;
-  const userInstructions = template
-    .replace(/\{fromLocale\}/g, fromLocale)
-    .replace(/\{toLocale\}/g, toLocale)
-    .replace(
-      /\{recordContext\}/g,
-      recordContext || 'No additional context available.',
-    )
+  const replacements: Record<string, string> = {
+    '{fromLocale}': fromLocale,
+    '{toLocale}': toLocale,
+    '{recordContext}': recordContext || 'No additional context available.',
     // content is sent as a JSON array below, not a single {fieldValue}
-    .replace(/\{fieldValue\}/g, '(see the JSON array below)');
+    '{fieldValue}': '(see the JSON array below)',
+  };
+  // Substitute only the template itself; inserted content must stay literal.
+  const userInstructions = template.replace(
+    /\{(?:fromLocale|toLocale|recordContext|fieldValue)\}/g,
+    (placeholder) => replacements[placeholder],
+  );
 
   return `${userInstructions}
+
+TRANSLATION REQUIREMENTS (required — overrides any conflicting translation guidance above):
+Translate the following array of strings from ${fromLocale} to ${toLocale}.
+You may encounter ICU Message Format strings (e.g., {gender, select, male {He said} female {She said}}). You MUST preserve the structure, keywords, and variable keys exactly. ONLY translate the human-readable content inside the brackets.
 
 OUTPUT FORMAT (required — overrides any conflicting output guidance above):
 Return ONLY a valid JSON array of strings, the exact same length as the input array, with a strict one-to-one mapping: each input string maps to exactly one output string. NEVER split a single input string into multiple array elements and never merge multiple inputs into one, even when a string contains newlines or multiple HTML blocks like <p>…</p><p>…</p> — translate the whole string as one element. Preserve tokens like ⟦PH_0⟧ exactly, unchanged. Do not explain, do not add commentary.`;
