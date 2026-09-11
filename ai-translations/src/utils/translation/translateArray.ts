@@ -6,19 +6,17 @@
  */
 
 import type { ctxParamsType } from '../../entrypoints/Config/ConfigScreen';
+import { defaultPrompt } from '../../prompts/DefaultPrompt';
 import { createLogger, type Logger } from '../logging/Logger';
 import { resolveGlossaryId } from './DeepLGlossary';
 import { isFormalitySupported, mapDatoToDeepL } from './DeepLMap';
-import {
-  formatErrorForUser,
-  normalizeProviderError,
-} from './ProviderErrors';
+import { formatErrorForUser, normalizeProviderError } from './ProviderErrors';
 import {
   type BatchTranslationOptions,
-  type ProviderDebugHooks,
-  ProviderConfigurationError,
-  ProviderError,
   isProviderError,
+  ProviderConfigurationError,
+  type ProviderDebugHooks,
+  ProviderError,
   type TranslationProvider,
 } from './types';
 
@@ -242,12 +240,15 @@ function parseTranslationResponse(
   let fixed: string[];
   if (isOverSplitRejoin) {
     fixed = [stringParts.join('\n')];
-    logger.warning('Model over-split a single HTML segment; rejoined elements', {
-      ...context,
-      rawResponse: responseText,
-      parsedArray: arr,
-      returnedLength: arr.length,
-    });
+    logger.warning(
+      'Model over-split a single HTML segment; rejoined elements',
+      {
+        ...context,
+        rawResponse: responseText,
+        parsedArray: arr,
+        returnedLength: arr.length,
+      },
+    );
   } else {
     // Length repair: ensure output has same length as input
     fixed = [];
@@ -424,25 +425,75 @@ async function translateWithNativeBatchProvider(
 }
 
 /**
+ * Builds the instruction sent to chat vendors, combining the user's configured
+ * prompt (or the built-in default) with the JSON-array output format the
+ * parsing/repair logic below relies on.
+ *
+ * @param pluginParams - Plugin configuration, used to read the configured prompt.
+ * @param fromLocale - Source locale code.
+ * @param toLocale - Target locale code.
+ * @param recordContext - Additional context to substitute into {recordContext}.
+ * @returns The full instruction to prepend to the JSON array payload.
+ */
+function buildChatInstruction(
+  pluginParams: ctxParamsType,
+  fromLocale: string,
+  toLocale: string,
+  recordContext: string,
+): string {
+  const template = pluginParams.prompt || defaultPrompt;
+  const replacements: Record<string, string> = {
+    '{fromLocale}': fromLocale,
+    '{toLocale}': toLocale,
+    '{recordContext}': recordContext || 'No additional context available.',
+    // content is sent as a JSON array below, not a single {fieldValue}
+    '{fieldValue}': '(see the JSON array below)',
+  };
+  // Substitute only the template itself; inserted content must stay literal.
+  const userInstructions = template.replace(
+    /\{(?:fromLocale|toLocale|recordContext|fieldValue)\}/g,
+    (placeholder) => replacements[placeholder],
+  );
+
+  return `${userInstructions}
+
+TRANSLATION REQUIREMENTS (required — overrides any conflicting translation guidance above):
+Translate the following array of strings from ${fromLocale} to ${toLocale}.
+You may encounter ICU Message Format strings (e.g., {gender, select, male {He said} female {She said}}). You MUST preserve the structure, keywords, and variable keys exactly. ONLY translate the human-readable content inside the brackets.
+
+OUTPUT FORMAT (required — overrides any conflicting output guidance above):
+Return ONLY a valid JSON array of strings, the exact same length as the input array, with a strict one-to-one mapping: each input string maps to exactly one output string. NEVER split a single input string into multiple array elements and never merge multiple inputs into one, even when a string contains newlines or multiple HTML blocks like <p>…</p><p>…</p> — translate the whole string as one element. Preserve tokens like ⟦PH_0⟧ exactly, unchanged. Do not explain, do not add commentary.`;
+}
+
+/**
  * Translates an array of protected segments using a chat vendor (OpenAI, Gemini, Anthropic)
  * by sending a JSON-array prompt. Large arrays are chunked for reliability.
  *
  * @param provider - Chat-based translation provider.
+ * @param pluginParams - Plugin configuration, used to read the configured prompt.
  * @param protectedSegments - Tokenized (placeholder-safe) text segments.
  * @param fromLocale - Source locale code.
  * @param toLocale - Target locale code.
+ * @param recordContext - Additional context about the record being translated.
  * @returns Translated segments in order.
  */
 async function translateWithChatProvider(
   provider: TranslationProvider,
+  pluginParams: ctxParamsType,
   protectedSegments: string[],
   fromLocale: string,
   toLocale: string,
   logger: Logger,
   providerDebugHooks: ProviderDebugHooks,
   isHtml: boolean,
+  recordContext: string,
 ): Promise<string[]> {
-  const instruction = `Translate the following array of strings from ${fromLocale} to ${toLocale}. Return ONLY a valid JSON array of the exact same length, with a strict one-to-one mapping: each input string maps to exactly one output string. NEVER split a single input string into multiple array elements and never merge multiple inputs into one, even when a string contains newlines or multiple HTML blocks like <p>…</p><p>…</p> — translate the whole string as one element. Preserve placeholders like {foo}, {{bar}}, and tokens like ⟦PH_0⟧. You may encounter ICU Message Format strings (e.g., {gender, select, male {He said} female {She said}}). You MUST preserve the structure, keywords, and variable keys exactly. ONLY translate the human-readable content inside the brackets. Do not explain.`;
+  const instruction = buildChatInstruction(
+    pluginParams,
+    fromLocale,
+    toLocale,
+    recordContext,
+  );
 
   if (protectedSegments.length <= CHAT_VENDOR_CHUNK_SIZE) {
     const prompt = `${instruction}\n${JSON.stringify(protectedSegments)}`;
@@ -590,12 +641,14 @@ export async function translateArray(
     } else {
       out = await translateWithChatProvider(
         provider,
+        pluginParams,
         protectedSegments,
         fromLocale,
         toLocale,
         logger,
         providerDebugHooks,
         opts.isHTML === true,
+        opts.recordContext ?? '',
       );
     }
 
