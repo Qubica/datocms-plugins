@@ -1,5 +1,8 @@
 # Changelog
 
+- 3.7.1:
+  - Fixed custom translation prompts and record context being ignored by chat providers, including SEO and chunked translations. Translation requests retain the selected languages, ICU syntax rules, and JSON-array output requirements, and insert record context literally.
+  - Fixed reading default asset alt text and titles when translating file fields with the updated Content Management API client.
 - 3.7.0:
   - Added Yandex Translate as a native provider for field, whole-record, and bulk translations. It includes API-key and optional Folder ID configuration, credential testing, supported-locale resolution, HTML-aware requests, placeholder preservation, sequential rate limiting, Unicode-aware batching within Yandex's 10,000-character limit, actionable API errors, and automatic routing through the built-in DatoCMS CORS proxy.
   - Added a post-translation **Publish all translated records** action. It appears only when successfully updated records belong to models with draft/published mode enabled, publishes through the CMA in batches of up to 200 records, and can retry only the remaining records after a partial failure.
