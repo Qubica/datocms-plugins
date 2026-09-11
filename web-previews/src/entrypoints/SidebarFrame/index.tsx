@@ -19,6 +19,7 @@ import type { ViewportSize } from '../../components/Browser/ViewportCustomizer';
 import { ViewportCustomizer } from '../../components/Browser/ViewportCustomizer';
 import { ViewportSelector } from '../../components/Browser/ViewportSelector';
 import { ButtonGroup, ButtonGroupButton } from '../../components/ButtonGroup';
+import { PreviewSetupGuide } from '../../components/PreviewSetupGuide';
 import {
   normalizeParameters,
   type Parameters,
@@ -291,6 +292,8 @@ const SidebarFrame = ({ ctx }: PropTypes) => {
               </>
             )}
           </Toolbar>
+
+          {frontends.length === 0 && <PreviewSetupGuide />}
 
           {currentPreviewLink && effectivePreviewLink && (
             <>

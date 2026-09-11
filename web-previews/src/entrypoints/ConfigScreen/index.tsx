@@ -6,6 +6,7 @@ import type { RenderConfigScreenCtx } from 'datocms-plugin-sdk';
 import {
   Button,
   Canvas,
+  FieldError,
   FieldGroup,
   Form,
   Section,
@@ -193,7 +194,14 @@ export default function ConfigScreen({ ctx }: PropTypes) {
         }}
         mutators={{ ...arrayMutators }}
       >
-        {({ handleSubmit, submitting, dirty, values }) => (
+        {({
+          handleSubmit,
+          submitting,
+          dirty,
+          values,
+          submitFailed,
+          hasValidationErrors,
+        }) => (
           <Form onSubmit={handleSubmit}>
             <Section
               title="Frontends"
@@ -204,7 +212,7 @@ export default function ConfigScreen({ ctx }: PropTypes) {
                 provides.
               </p>
               <FieldArray<RawFrontend> name="frontends">
-                {({ fields }) => (
+                {({ fields, meta: { error } }) => (
                   <FieldGroup>
                     {fields.map((name, index) => (
                       <FrontendFieldItem
@@ -212,6 +220,7 @@ export default function ConfigScreen({ ctx }: PropTypes) {
                         name={name}
                         index={index}
                         frontend={fields.value[index]}
+                        error={error?.[index]?._error}
                         onRemove={() => fields.remove(index)}
                       />
                     ))}
@@ -327,6 +336,11 @@ export default function ConfigScreen({ ctx }: PropTypes) {
                 </Field>
               </FieldGroup>
             </Section>
+            {submitFailed && hasValidationErrors && (
+              <div role="alert">
+                <FieldError>Fix the errors above before saving.</FieldError>
+              </div>
+            )}
             <Button
               type="submit"
               fullWidth

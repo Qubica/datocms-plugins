@@ -7,6 +7,7 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import type { RenderItemFormSidebarPanelCtx } from 'datocms-plugin-sdk';
 import { Canvas, Spinner, useCtx } from 'datocms-react-ui';
 import { ButtonGroup, ButtonGroupButton } from '../../components/ButtonGroup';
+import { PreviewSetupGuide } from '../../components/PreviewSetupGuide';
 import type { Frontend } from '../../types';
 import { type FrontendStatus, useStatusByFrontend } from '../../utils/common';
 import {
@@ -130,7 +131,7 @@ const PreviewUrl = ({ ctx }: PropTypes) => {
     <Canvas ctx={ctx}>
       {statusByFrontend ? (
         frontends.length === 0 ? (
-          <div>No frontends configured!</div>
+          <PreviewSetupGuide compact />
         ) : frontends.length === 1 && firstStatus ? (
           <FrontendResult status={firstStatus} frontend={frontends[0]} />
         ) : Object.values(statusByFrontend).every(

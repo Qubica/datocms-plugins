@@ -1,6 +1,12 @@
 import { faTrash } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { Button, FieldGroup, SwitchField, TextField } from 'datocms-react-ui';
+import {
+  Button,
+  FieldError,
+  FieldGroup,
+  SwitchField,
+  TextField,
+} from 'datocms-react-ui';
 import { Field } from 'react-final-form';
 import type { RawFrontend } from '../../../types';
 import s from '../styles.module.css';
@@ -11,10 +17,17 @@ type Props = {
   name: string;
   index: number;
   frontend: RawFrontend;
+  error?: string;
   onRemove: () => void;
 };
 
-export function FrontendFieldItem({ name, index, frontend, onRemove }: Props) {
+export function FrontendFieldItem({
+  name,
+  index,
+  frontend,
+  error,
+  onRemove,
+}: Props) {
   return (
     <div className={s.group}>
       <div className={s.deletableItem}>
@@ -34,6 +47,12 @@ export function FrontendFieldItem({ name, index, frontend, onRemove }: Props) {
 
           <PreviewLinksSection name={name} index={index} frontend={frontend} />
           <VisualEditingSection name={name} index={index} frontend={frontend} />
+
+          {error && (
+            <div role="alert">
+              <FieldError>{error}</FieldError>
+            </div>
+          )}
 
           <Field name={`${name}.disabled`}>
             {({ input, meta: { error } }) => (

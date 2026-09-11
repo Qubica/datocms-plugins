@@ -3,6 +3,7 @@ import type { Frontend, PreviewLinkWithFrontend } from '../../../types';
 import type { FrontendStatus } from '../../../utils/common';
 import { FrontendGroup } from './FrontendGroup';
 import { FrontendPreviewLinks } from './FrontendPreviewLinks';
+import styles from './styles.module.css';
 import { Trigger } from './Trigger';
 
 type Props = {
@@ -22,6 +23,10 @@ export function PreviewLinkSelector({
 }: Props) {
   const firstStatus = Object.values(statusByFrontend)[0];
 
+  if (frontends.length === 0) {
+    return <div className={styles.emptyState}>Website preview</div>;
+  }
+
   return (
     <Dropdown
       renderTrigger={(props) => (
@@ -29,9 +34,7 @@ export function PreviewLinkSelector({
       )}
     >
       <DropdownMenu>
-        {frontends.length === 0 ? (
-          <div>No frontends configured!</div>
-        ) : frontends.length === 1 && firstStatus ? (
+        {frontends.length === 1 && firstStatus ? (
           <FrontendPreviewLinks
             status={firstStatus}
             frontend={frontends[0]}
