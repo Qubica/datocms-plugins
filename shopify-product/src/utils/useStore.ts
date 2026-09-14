@@ -1,17 +1,14 @@
 /**
  * Zustand store for Shopify product data.
  *
- * This store manages three normalized caches, all persisted to localStorage:
- *
- * - `products`  — caches individual Product objects and their fetch status.
- *                 Keyed by product handle (search results and handle lookups)
- *                 or by `id:<numeric id>` for lookups by product ID, see
- *                 `productLookupCacheKey`. Shared between the browse modal and
- *                 the field value display.
- * - `variants`  — keyed by numeric variant ID, caches ProductVariant objects
- *                 (each carrying its parent product) and fetch status.
- * - `searches`  — keyed by search query string, caches the list of matching
- *                 product handles (not full objects) and fetch status.
+ * - `products`        — products and variants referenced by fields plus
+ *                       search results, keyed by `selectionKey` (search
+ *                       results use the bare handle). Persisted to
+ *                       localStorage: only successful entries, capped.
+ * - `productVariants` — variants of a product listed in the browse modal,
+ *                       keyed by handle. In-memory only.
+ * - `searches`        — keyed by search query string, caches the list of
+ *                       matching product handles (not full objects). Persisted.
  *
  * Searches store only handles (not full product data) to avoid duplicating
  * product objects. The full product is always read from `products[handle]`.
@@ -20,63 +17,131 @@
  * while keeping immutable state under the hood.
  *
  * IMPORTANT: Zustand 5 uses React's `useSyncExternalStore`, which requires
- * selectors to return referentially stable values. Methods like `getProduct`
- * create new objects on each call, so consumers MUST use `useShallow` from
- * `zustand/react/shallow` when calling them as selectors to prevent infinite
- * re-render loops. See BrowseProductsModal and Value for examples.
+ * selectors to return referentially stable values. Entries are returned as
+ * stored (or the shared `LOADING_ENTRY`), so plain selectors are safe;
+ * selectors that build new arrays or objects must use `useShallow` from
+ * `zustand/react/shallow`. See BrowseProductsModal for an example.
  */
 
 import { produce } from 'immer';
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import {
+  createJSONStorage,
+  persist,
+  type StateStorage,
+} from 'zustand/middleware';
 import type ShopifyClient from './ShopifyClient';
 import type { Product, ProductVariant } from './ShopifyClient';
-import { type ProductLookup, productLookupCacheKey } from './shopifyIds';
+import {
+  type FieldSelection,
+  lookupCandidates,
+  selectionKey,
+} from './shopifyIds';
 
 export type Status = 'loading' | 'success' | 'error';
+
+export type Entry<T> = { result: T | null; status: Status };
+
+/** Entry returned for keys not in the cache yet. */
+export const LOADING_ENTRY: Entry<never> = { result: null, status: 'loading' };
 
 export type State = {
   /** The current search query displayed in the browse modal. */
   query: string;
 
   /** Normalized cache of search results, keyed by query string. */
-  searches: Record<string, { result: string[] | null; status: Status }>;
+  searches: Record<string, Entry<string[]>>;
 
-  /** Normalized cache of individual products, see `productLookupCacheKey`. */
-  products: Record<string, { result: Product | null; status: Status }>;
+  /** Products and variants, keyed by `selectionKey`. */
+  products: Record<string, Entry<Product | ProductVariant>>;
 
-  /** Normalized cache of individual variants, keyed by numeric variant ID. */
-  variants: Record<string, { result: ProductVariant | null; status: Status }>;
+  /** Variants per product handle, for the browse modal. */
+  productVariants: Record<string, Entry<ProductVariant[]>>;
 
-  /**
-   * Derives a single product's data and fetch status from the cache.
-   * Returns a new object — wrap with `useShallow` when used as a selector.
-   */
-  getProduct(key: string): {
-    status: Status;
-    product: Product | null;
-  };
+  /** Resolves what a field references and caches it under its key. */
+  fetchSelection(
+    client: ShopifyClient,
+    selection: FieldSelection,
+  ): Promise<void>;
 
-  /**
-   * Derives a single variant's data and fetch status from the cache.
-   * Returns a new object — wrap with `useShallow` when used as a selector.
-   */
-  getVariant(id: string): {
-    status: Status;
-    variant: ProductVariant | null;
-  };
-
-  /** Fetches a single product by handle or ID and caches the result. */
-  fetchProduct(client: ShopifyClient, lookup: ProductLookup): Promise<void>;
-
-  /** Fetches a single variant by its numeric ID and caches the result. */
-  fetchVariant(client: ShopifyClient, id: string): Promise<void>;
+  /** Lists a product's variants, reusing the cache when already loaded. */
+  fetchProductVariants(client: ShopifyClient, product: Product): Promise<void>;
 
   /** Searches for products matching a query string and caches the results. */
   fetchProductsMatching(client: ShopifyClient, query: string): Promise<void>;
 };
 
-const useStore = create(
+async function lookup(
+  client: ShopifyClient,
+  selection: FieldSelection,
+): Promise<Product | ProductVariant | null> {
+  try {
+    if (selection.kind === 'variant') {
+      return await client.variantById(selection.id);
+    }
+
+    return selection.lookup.by === 'id'
+      ? await client.productById(selection.lookup.value)
+      : await client.productByHandle(selection.lookup.value);
+  } catch (_e) {
+    return null;
+  }
+}
+
+/** Tries each candidate lookup in order and returns the first hit. */
+async function resolveSelection(
+  client: ShopifyClient,
+  selection: FieldSelection,
+): Promise<Product | ProductVariant | null> {
+  for (const candidate of lookupCandidates(selection)) {
+    // biome-ignore lint/performance/noAwaitInLoops: candidates are fallbacks, tried one at a time
+    const result = await lookup(client, candidate);
+
+    if (result) {
+      return result;
+    }
+  }
+
+  return null;
+}
+
+/** Keep the persisted cache bounded: successful entries only, most recent last. */
+const MAX_PERSISTED_ENTRIES = 200;
+
+function persistedProducts(products: State['products']): State['products'] {
+  const entries = Object.entries(products).filter(
+    ([, entry]) => entry.status === 'success' && entry.result,
+  );
+
+  return Object.fromEntries(entries.slice(-MAX_PERSISTED_ENTRIES));
+}
+
+/** localStorage that never throws: a full quota or a blocked store only disables persistence. */
+const safeLocalStorage: StateStorage = {
+  getItem: (name) => {
+    try {
+      return localStorage.getItem(name);
+    } catch (_e) {
+      return null;
+    }
+  },
+  setItem: (name, value) => {
+    try {
+      localStorage.setItem(name, value);
+    } catch (_e) {
+      // Quota exceeded or storage unavailable: keep the in-memory cache only.
+    }
+  },
+  removeItem: (name) => {
+    try {
+      localStorage.removeItem(name);
+    } catch (_e) {
+      // Nothing to do.
+    }
+  },
+};
+
+const useStore = create<State>()(
   persist(
     (rawSet, get) => {
       // Wraps zustand's `set` with Immer's `produce` so state updates
@@ -88,74 +153,52 @@ const useStore = create(
       return {
         query: '',
         products: {},
-        variants: {},
+        productVariants: {},
         searches: {},
 
-        getProduct(key: string) {
-          const selectedProduct = (get() as State).products[key];
-
-          return {
-            status: selectedProduct?.status
-              ? selectedProduct.status
-              : 'loading',
-            product: selectedProduct?.result,
-          };
-        },
-
-        getVariant(id: string) {
-          const selectedVariant = (get() as State).variants[id];
-
-          return {
-            status: selectedVariant?.status
-              ? selectedVariant.status
-              : 'loading',
-            variant: selectedVariant?.result,
-          };
-        },
-
-        async fetchProduct(client: ShopifyClient, lookup: ProductLookup) {
-          const key = productLookupCacheKey(lookup);
+        async fetchSelection(client: ShopifyClient, selection: FieldSelection) {
+          const key = selectionKey(selection);
 
           set((state) => {
-            state.products[key] = state.products[key] || { result: null };
-            state.products[key].status = 'loading';
+            state.products[key] = {
+              result: state.products[key]?.result ?? null,
+              status: 'loading',
+            };
           });
 
-          try {
-            const product =
-              lookup.by === 'id'
-                ? await client.productById(lookup.value)
-                : await client.productByHandle(lookup.value);
+          const result = await resolveSelection(client, selection);
 
-            set((state) => {
-              state.products[key].result = product;
-              state.products[key].status = 'success';
-            });
-          } catch (_e) {
-            set((state) => {
-              state.products[key].result = null;
-              state.products[key].status = 'error';
-            });
+          set((state) => {
+            state.products[key] = {
+              result,
+              status: result ? 'success' : 'error',
+            };
+          });
+        },
+
+        async fetchProductVariants(client: ShopifyClient, product: Product) {
+          const { handle } = product;
+
+          if (get().productVariants[handle]?.status === 'success') {
+            return;
           }
-        },
 
-        async fetchVariant(client: ShopifyClient, id: string) {
           set((state) => {
-            state.variants[id] = state.variants[id] || { result: null };
-            state.variants[id].status = 'loading';
+            state.productVariants[handle] = { result: null, status: 'loading' };
           });
 
           try {
-            const variant = await client.variantById(id);
+            const variants = await client.variantsOfProduct(product);
 
             set((state) => {
-              state.variants[id].result = variant;
-              state.variants[id].status = 'success';
+              state.productVariants[handle] = {
+                result: variants,
+                status: 'success',
+              };
             });
           } catch (_e) {
             set((state) => {
-              state.variants[id].result = null;
-              state.variants[id].status = 'error';
+              state.productVariants[handle] = { result: null, status: 'error' };
             });
           }
         },
@@ -177,9 +220,10 @@ const useStore = create(
               state.searches[query].result = products.map((p) => p.handle);
 
               for (const product of products) {
-                state.products[product.handle] =
-                  state.products[product.handle] || {};
-                state.products[product.handle].result = product;
+                state.products[product.handle] = {
+                  result: product,
+                  status: 'success',
+                };
               }
             });
           } catch (_e) {
@@ -193,6 +237,11 @@ const useStore = create(
     },
     {
       name: 'datocms-plugin-shopify-product',
+      storage: createJSONStorage(() => safeLocalStorage),
+      partialize: (state) => ({
+        products: persistedProducts(state.products),
+        searches: state.searches,
+      }),
     },
   ),
 );

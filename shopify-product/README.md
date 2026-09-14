@@ -20,7 +20,7 @@ When you hook the plugin to a field manually, the field's editor settings let yo
 
 Single-line fields holding variants always store the numeric variant ID (`gid://shopify/ProductVariant/987654321` is stored as `987654321`), since variants have no handle.
 
-Changing these settings does not rewrite values that are already saved. A field switched to product IDs keeps resolving handles stored earlier.
+Changing these settings does not rewrite values that are already saved, and values saved under a previous setting keep resolving: the plugin tries the configured lookup first and falls back to the other interpretation (handle or ID, product or variant) when Shopify returns nothing.
 
 For fields the plugin is auto-applied to, the same two choices are configured once on the plugin settings screen ("Auto-applied fields let editors pick" and "Auto-applied single-line fields store").
 

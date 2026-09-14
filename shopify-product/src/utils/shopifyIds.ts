@@ -30,6 +30,10 @@ export function toVariantGid(id: string): string {
   return id.startsWith('gid://') ? id : `${VARIANT_GID_PREFIX}${id}`;
 }
 
+export function isNumericId(value: string): boolean {
+  return NUMERIC_PATTERN.test(value);
+}
+
 /** How to look a product up on Shopify. */
 export type ProductLookup = { by: 'handle' | 'id'; value: string };
 
@@ -39,16 +43,50 @@ export type FieldSelection =
   | { kind: 'variant'; id: string };
 
 /**
- * Cache key for the products store. Handles are used as-is so search results
- * (always keyed by handle) share entries with handle lookups; ID lookups get a
- * distinct namespace.
+ * Cache key of a selection in the store. Handles are used as-is so search
+ * results (always keyed by handle) share entries with handle lookups; ID and
+ * variant lookups get their own namespaces.
  */
-export function productLookupCacheKey(lookup: ProductLookup): string {
-  return lookup.by === 'id' ? `id:${lookup.value}` : lookup.value;
+export function selectionKey(selection: FieldSelection): string {
+  if (selection.kind === 'variant') {
+    return `variant:${selection.id}`;
+  }
+
+  return selection.lookup.by === 'id'
+    ? `id:${selection.lookup.value}`
+    : selection.lookup.value;
+}
+
+/**
+ * Selections to try, in order, when resolving a stored value. The one derived
+ * from the field settings comes first; the alternatives cover values saved
+ * under a different setting: numeric handles read as IDs, IDs saved before the
+ * field was switched back to handles, and product IDs in a field that now
+ * holds variants.
+ */
+export function lookupCandidates(selection: FieldSelection): FieldSelection[] {
+  if (selection.kind === 'variant') {
+    return [
+      selection,
+      { kind: 'product', lookup: { by: 'id', value: selection.id } },
+    ];
+  }
+
+  const { by, value } = selection.lookup;
+
+  if (by === 'id') {
+    return [selection, { kind: 'product', lookup: { by: 'handle', value } }];
+  }
+
+  if (isNumericId(value)) {
+    return [selection, { kind: 'product', lookup: { by: 'id', value } }];
+  }
+
+  return [selection];
 }
 
 function looksLikeId(value: string): boolean {
-  return NUMERIC_PATTERN.test(value) || GID_PATTERN.test(value);
+  return isNumericId(value) || GID_PATTERN.test(value);
 }
 
 /**
@@ -69,22 +107,41 @@ export function resolveProductLookup(
   return { by: 'handle', value };
 }
 
-function kindFromGid(id: string, fallback: FieldParameters['selection']) {
-  if (id.startsWith(VARIANT_GID_PREFIX)) {
-    return 'variant';
-  }
-
-  if (id.startsWith(PRODUCT_GID_PREFIX)) {
-    return 'product';
-  }
-
-  return fallback;
-}
-
-function selectionFromJson(
+/**
+ * Classifies a single-line field value. A GID prefix is authoritative, a
+ * numeric value follows the field settings, anything else is a handle (which
+ * can only denote a product, whatever the field is configured for).
+ */
+function selectionFromString(
   rawValue: string,
   params: FieldParameters,
-): FieldSelection | null {
+): FieldSelection {
+  const value = rawValue.trim();
+
+  if (value.startsWith(VARIANT_GID_PREFIX)) {
+    return { kind: 'variant', id: toNumericId(value) };
+  }
+
+  if (value.startsWith(PRODUCT_GID_PREFIX)) {
+    return { kind: 'product', lookup: { by: 'id', value: toNumericId(value) } };
+  }
+
+  if (params.selection === 'variant' && isNumericId(value)) {
+    return { kind: 'variant', id: value };
+  }
+
+  return {
+    kind: 'product',
+    lookup: resolveProductLookup(value, params.productStringValue),
+  };
+}
+
+/**
+ * Classifies a stored JSON object by its shape: variant objects written by
+ * this plugin always nest their `product`, product objects never do. The
+ * field settings play no part, so switching them never misreads old values.
+ */
+function selectionFromJson(rawValue: string): FieldSelection | null {
   let parsed: unknown;
 
   try {
@@ -100,10 +157,11 @@ function selectionFromJson(
   const record = parsed as Record<string, unknown>;
   const id = typeof record.id === 'string' ? record.id : '';
   const handle = typeof record.handle === 'string' ? record.handle : '';
+  const isVariant =
+    (typeof record.product === 'object' && record.product !== null) ||
+    id.startsWith(VARIANT_GID_PREFIX);
 
-  // Stored JSON objects carry a full GID, so the object itself tells us
-  // whether it is a product or a variant regardless of the current setting.
-  if (kindFromGid(id, params.selection) === 'variant') {
+  if (isVariant) {
     return id ? { kind: 'variant', id: toNumericId(id) } : null;
   }
 
@@ -130,19 +188,8 @@ export function selectionFromFieldValue(
   }
 
   if (fieldType === 'json') {
-    return selectionFromJson(rawValue, params);
+    return selectionFromJson(rawValue);
   }
 
-  if (fieldType !== 'string') {
-    return null;
-  }
-
-  if (params.selection === 'variant') {
-    return { kind: 'variant', id: toNumericId(rawValue) };
-  }
-
-  return {
-    kind: 'product',
-    lookup: resolveProductLookup(rawValue, params.productStringValue),
-  };
+  return fieldType === 'string' ? selectionFromString(rawValue, params) : null;
 }

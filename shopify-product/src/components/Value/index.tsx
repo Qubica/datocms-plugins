@@ -4,39 +4,32 @@ import classNames from 'classnames';
 import type { RenderFieldExtensionCtx } from 'datocms-plugin-sdk';
 import { useCtx } from 'datocms-react-ui';
 import { useEffect, useMemo } from 'react';
-import { useShallow } from 'zustand/react/shallow';
 import { getShopifyClientConfig, parseAndNormalizeConfig } from '../../types';
-import ShopifyClient from '../../utils/ShopifyClient';
-import {
-  type FieldSelection,
-  productLookupCacheKey,
-} from '../../utils/shopifyIds';
-import useStore, { type State } from '../../utils/useStore';
+import ShopifyClient, {
+  isProductVariant,
+  type Product,
+  type ProductVariant,
+} from '../../utils/ShopifyClient';
+import { type FieldSelection, selectionKey } from '../../utils/shopifyIds';
+import useStore, { LOADING_ENTRY } from '../../utils/useStore';
 import ProductCard from './ProductCard';
 import s from './styles.module.css';
 
 export type ValueProps = {
+  /** Memoized by the caller: the effect below refetches when it changes. */
   selection: FieldSelection;
   onReset: () => void;
 };
 
-/** Reads whatever the field references (product or variant) from the cache. */
-function resolveSelection(state: State, selection: FieldSelection) {
-  if (selection.kind === 'variant') {
-    const { status, variant } = state.getVariant(selection.id);
-
-    return {
-      status,
-      product: variant?.product ?? null,
-      variant: variant ?? null,
-    };
+/** Splits a cached entry into the product to show and the variant, if any. */
+function splitResult(result: Product | ProductVariant | null) {
+  if (!result) {
+    return { product: null, variant: null };
   }
 
-  const { status, product } = state.getProduct(
-    productLookupCacheKey(selection.lookup),
-  );
-
-  return { status, product: product ?? null, variant: null };
+  return isProductVariant(result)
+    ? { product: result.product, variant: result }
+    : { product: result, variant: null };
 }
 
 export default function Value({ selection, onReset }: ValueProps) {
@@ -51,29 +44,19 @@ export default function Value({ selection, onReset }: ValueProps) {
     [storefrontAccessToken, shopifyDomain],
   );
 
-  // resolveSelection() returns a new object each call; useShallow prevents
-  // infinite re-renders by comparing its fields shallowly.
-  const { product, variant, status } = useStore(
-    useShallow((state) => resolveSelection(state as State, selection)),
+  const key = selectionKey(selection);
+  const { result, status } = useStore(
+    (state) => state.products[key] ?? LOADING_ENTRY,
   );
-
-  const fetchProduct = useStore((state) => (state as State).fetchProduct);
-  const fetchVariant = useStore((state) => (state as State).fetchVariant);
-
-  // `selection` is rebuilt on every render, so the effect depends on its
-  // primitive parts to avoid refetching in a loop.
-  const kind = selection.kind;
-  const by = selection.kind === 'product' ? selection.lookup.by : 'id';
-  const value =
-    selection.kind === 'product' ? selection.lookup.value : selection.id;
+  const fetchSelection = useStore((state) => state.fetchSelection);
 
   useEffect(() => {
-    if (kind === 'variant') {
-      fetchVariant(client, value);
-    } else {
-      fetchProduct(client, { by, value });
-    }
-  }, [client, kind, by, value, fetchProduct, fetchVariant]);
+    fetchSelection(client, selection);
+  }, [client, selection, fetchSelection]);
+
+  const { product, variant } = splitResult(result);
+  const storedValue =
+    selection.kind === 'variant' ? selection.id : selection.lookup.value;
 
   return (
     <div
@@ -84,8 +67,8 @@ export default function Value({ selection, onReset }: ValueProps) {
       {status === 'error' && (
         <div className={s.product}>
           API Error! Could not fetch details for{' '}
-          {kind === 'variant' ? 'product variant' : 'product'}:&nbsp;
-          <code>{value}</code>
+          {selection.kind === 'variant' ? 'product variant' : 'product'}:&nbsp;
+          <code>{storedValue}</code>
         </div>
       )}
       {product && <ProductCard product={product} variant={variant} />}

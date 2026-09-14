@@ -42,7 +42,8 @@
   color: var(--color--ink-link);
 }
 
-.product__title a {
+.product__title a,
+.product__title span {
   font-size: 17px;
   text-decoration: none;
   font-weight: bold;

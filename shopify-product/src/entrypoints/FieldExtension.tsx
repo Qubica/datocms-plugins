@@ -1,6 +1,7 @@
 import type { RenderFieldExtensionCtx } from 'datocms-plugin-sdk';
 import { Canvas } from 'datocms-react-ui';
 import get from 'lodash-es/get';
+import { useMemo } from 'react';
 import Empty from '../components/Empty';
 import Value from '../components/Value';
 import {
@@ -39,12 +40,31 @@ function fieldValueFor(
 
 export default function FieldExtension({ ctx }: PropTypes) {
   const fieldType = ctx.field.attributes.field_type;
-  const params = normalizeFieldParameters(ctx.parameters);
+  const { selection: selectionKind, productStringValue } =
+    normalizeFieldParameters(ctx.parameters);
   const rawValue = get(ctx.formValues, ctx.fieldPath);
-  const selection = selectionFromFieldValue(rawValue, fieldType, params);
+
+  // Memoized on primitives: `ctx` is rebuilt on every SDK update, and a
+  // stable selection lets `Value` fetch only when the stored value changes.
+  const selection = useMemo(
+    () =>
+      selectionFromFieldValue(rawValue, fieldType, {
+        paramsVersion: '1',
+        selection: selectionKind,
+        productStringValue,
+      }),
+    [rawValue, fieldType, selectionKind, productStringValue],
+  );
 
   const handleSelect = (picked: Product | ProductVariant) => {
-    ctx.setFieldValue(ctx.fieldPath, fieldValueFor(picked, fieldType, params));
+    ctx.setFieldValue(
+      ctx.fieldPath,
+      fieldValueFor(picked, fieldType, {
+        paramsVersion: '1',
+        selection: selectionKind,
+        productStringValue,
+      }),
+    );
   };
 
   const handleReset = () => {
@@ -56,7 +76,7 @@ export default function FieldExtension({ ctx }: PropTypes) {
       {selection ? (
         <Value selection={selection} onReset={handleReset} />
       ) : (
-        <Empty selection={params.selection} onSelect={handleSelect} />
+        <Empty selection={selectionKind} onSelect={handleSelect} />
       )}
     </Canvas>
   );

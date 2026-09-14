@@ -1,34 +1,31 @@
 import { faSearch } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import classNames from 'classnames';
 import type { RenderModalCtx } from 'datocms-plugin-sdk';
-import { Button, Canvas, Spinner, TextInput } from 'datocms-react-ui';
+import { Button, Canvas, TextInput } from 'datocms-react-ui';
 import { type FormEvent, useEffect, useMemo, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { getShopifyClientConfig, parseAndNormalizeConfig } from '../../types';
-import { isSelectionKind } from '../../utils/fieldParameters';
-import ShopifyClient, { type Product } from '../../utils/ShopifyClient';
-import useStore, { type State } from '../../utils/useStore';
+import ShopifyClient, {
+  isProductVariant,
+  type Product,
+} from '../../utils/ShopifyClient';
+import useStore from '../../utils/useStore';
+import ProductList from './ProductList';
 import ProductVariants from './ProductVariants';
 import s from './styles.module.css';
 
 export default function BrowseProductsModal({ ctx }: { ctx: RenderModalCtx }) {
   // In variant mode a product click reveals its variants instead of
   // resolving the modal right away.
-  const pickVariants = isSelectionKind(ctx.parameters.selection)
-    ? ctx.parameters.selection === 'variant'
-    : false;
+  const pickVariants = ctx.parameters.selection === 'variant';
 
-  const performSearch = useStore(
-    (state) => (state as State).fetchProductsMatching,
-  );
+  const performSearch = useStore((state) => state.fetchProductsMatching);
 
   // Select primitives directly — these are referentially stable and safe
   // to use as zustand selectors without useShallow.
-  const query = useStore((state) => (state as State).query);
+  const query = useStore((state) => state.query);
   const status = useStore(
-    (state) =>
-      (state as State).searches[(state as State).query]?.status ?? 'loading',
+    (state) => state.searches[state.query]?.status ?? 'loading',
   );
 
   // Derives the product list by joining search result handles against the
@@ -36,12 +33,11 @@ export default function BrowseProductsModal({ ctx }: { ctx: RenderModalCtx }) {
   // to compare elements by reference and avoid infinite re-renders.
   const products = useStore(
     useShallow((state) => {
-      const s = state as State;
-      const result = s.searches[s.query]?.result;
+      const result = state.searches[state.query]?.result;
       if (!result) return null;
       return result
-        .map((handle: string) => s.products[handle]?.result)
-        .filter((p): p is Product => !!p);
+        .map((handle: string) => state.products[handle]?.result)
+        .filter((p): p is Product => !!p && !isProductVariant(p));
     }),
   );
 
@@ -98,7 +94,7 @@ export default function BrowseProductsModal({ ctx }: { ctx: RenderModalCtx }) {
           </Button>
         </form>
         <div className={s.container}>
-          {pickVariants && expandedProduct ? (
+          {expandedProduct ? (
             <ProductVariants
               client={client}
               product={expandedProduct}
@@ -106,43 +102,11 @@ export default function BrowseProductsModal({ ctx }: { ctx: RenderModalCtx }) {
               onSelect={(variant) => ctx.resolve(variant)}
             />
           ) : (
-            <>
-              {!!products?.length && (
-                <div
-                  className={classNames(s.products, {
-                    [s.products__loading]: status === 'loading',
-                  })}
-                >
-                  {products.map((product: Product) => (
-                    <button
-                      type="button"
-                      key={product.handle}
-                      onClick={() => handleProductClick(product)}
-                      className={s.product}
-                    >
-                      <div
-                        className={s.product__image}
-                        style={{
-                          backgroundImage: `url(${product.previewImageUrl || product.imageUrl})`,
-                        }}
-                      />
-                      <div className={s.product__content}>
-                        <div className={s.product__title}>{product.title}</div>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              )}
-              {status === 'loading' && (
-                <Spinner size={25} placement="centered" />
-              )}
-              {status === 'success' && products && products.length === 0 && (
-                <div className={s.empty}>No products found!</div>
-              )}
-              {status === 'error' && (
-                <div className={s.empty}>API call failed!</div>
-              )}
-            </>
+            <ProductList
+              products={products}
+              status={status}
+              onSelect={handleProductClick}
+            />
           )}
         </div>
       </div>

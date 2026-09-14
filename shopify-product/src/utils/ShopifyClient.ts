@@ -57,6 +57,28 @@ export function isProductVariant(
   return 'product' in picked;
 }
 
+/**
+ * Labels describing a variant beyond its title: its options (Shopify's
+ * placeholder "Title: Default Title" option is skipped), SKU and availability.
+ */
+export function variantMeta(variant: ProductVariant): string[] {
+  const labels = variant.selectedOptions
+    .filter(
+      (option) => option.name !== 'Title' || option.value !== 'Default Title',
+    )
+    .map((option) => `${option.name}: ${option.value}`);
+
+  if (variant.sku) {
+    labels.push(`SKU: ${variant.sku}`);
+  }
+
+  if (!variant.availableForSale) {
+    labels.push('Unavailable');
+  }
+
+  return labels;
+}
+
 const productFragment = `
   id
   title
@@ -221,12 +243,11 @@ export default class ShopifyClient {
   }
 
   /** Lists the first `MAX_VARIANTS_PER_PRODUCT` variants of a product. */
-  async variantsOfProduct(handle: string): Promise<ProductVariant[]> {
+  async variantsOfProduct(product: Product): Promise<ProductVariant[]> {
     const response = await this.fetch({
       query: `
         query getProductVariants($handle: String!, $first: Int!) {
           product: productByHandle(handle: $handle) {
-            ${productFragment}
             variants(first: $first) {
               edges {
                 node {
@@ -237,19 +258,16 @@ export default class ShopifyClient {
           }
         }
       `,
-      variables: { handle, first: MAX_VARIANTS_PER_PRODUCT },
+      variables: { handle: product.handle, first: MAX_VARIANTS_PER_PRODUCT },
     });
 
-    if (!response.product) {
+    const variants = response.product?.variants as
+      | RawEdges<RawVariantNode>
+      | undefined;
+
+    if (!variants) {
       throw new Error('Invalid product');
     }
-
-    // Keep the raw variant list out of the product object so stored JSON
-    // values only contain the selected variant, not all its siblings.
-    const { variants, ...rawProduct } = response.product as RawProductNode & {
-      variants: RawEdges<RawVariantNode>;
-    };
-    const product = normalizeProduct(rawProduct);
 
     return variants.edges.map((edge) => normalizeVariant(edge.node, product));
   }

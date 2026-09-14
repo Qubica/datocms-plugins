@@ -1,7 +1,11 @@
 import { faExternalLinkAlt } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import classNames from 'classnames';
-import type { Product, ProductVariant } from '../../utils/ShopifyClient';
+import {
+  type Product,
+  type ProductVariant,
+  variantMeta,
+} from '../../utils/ShopifyClient';
 import { toNumericId } from '../../utils/shopifyIds';
 import Price from '../Price';
 import s from './styles.module.css';
@@ -19,15 +23,6 @@ function storeUrl(product: Product, variant?: ProductVariant | null) {
   return variant
     ? `${product.onlineStoreUrl}?variant=${toNumericId(variant.id)}`
     : product.onlineStoreUrl;
-}
-
-/** Option pairs worth showing; Shopify's placeholder option is skipped. */
-function variantOptions(variant: ProductVariant): string[] {
-  return variant.selectedOptions
-    .filter(
-      (option) => option.name !== 'Title' || option.value !== 'Default Title',
-    )
-    .map((option) => `${option.name}: ${option.value}`);
 }
 
 function ProductPrice({ product }: { product: Product }) {
@@ -62,11 +57,11 @@ export default function ProductCard({ product, variant }: ProductCardProps) {
           {url ? (
             <a href={url} target="_blank" rel="noopener noreferrer">
               {product.title}
+              <FontAwesomeIcon icon={faExternalLinkAlt} />
             </a>
           ) : (
-            <a>{product.title}</a>
+            <span>{product.title}</span>
           )}
-          {url && <FontAwesomeIcon icon={faExternalLinkAlt} />}
         </div>
         {variant && (
           <div
@@ -77,19 +72,11 @@ export default function ProductCard({ product, variant }: ProductCardProps) {
             <strong>Variant:</strong>
             &nbsp;
             {variant.title}
-            {variantOptions(variant).map((option) => (
-              <span key={option} className={s.product__variant_option}>
-                {option}
+            {variantMeta(variant).map((label) => (
+              <span key={label} className={s.product__variant_option}>
+                {label}
               </span>
             ))}
-            {variant.sku && (
-              <span className={s.product__variant_option}>
-                SKU: {variant.sku}
-              </span>
-            )}
-            {!variant.availableForSale && (
-              <span className={s.product__variant_option}>Unavailable</span>
-            )}
           </div>
         )}
         <div className={s.product__description}>{product.description}</div>
