@@ -525,3 +525,65 @@ describe('DatoMcpClient', () => {
     expect(() => serializeDatoMcpToolResult({}, 12)).toThrow('at least 32');
   });
 });
+
+describe('MCP authentication recovery', () => {
+  it('preserves an authentication challenge without confusing permission failures with lost login', () => {
+    const challenge =
+      'Bearer error="invalid_token", resource_metadata="https://mcp.datocms.com/.well-known/oauth-protected-resource"';
+    expect(
+      serializeDatoMcpToolResult({
+        isError: true,
+        content: [{ type: 'text', text: 'Reconnect' }],
+        _meta: { 'mcp/www_authenticate': [challenge] },
+      }),
+    ).toMatchObject({
+      authenticationRequired: true,
+      authenticationChallenges: [challenge],
+    });
+    expect(
+      serializeDatoMcpToolResult({
+        isError: true,
+        content: [{ type: 'text', text: '401 INSUFFICIENT_PERMISSIONS' }],
+      }).authenticationRequired,
+    ).toBeUndefined();
+    expect(
+      serializeDatoMcpToolResult({
+        isError: true,
+        _meta: {
+          'mcp/www_authenticate': ['Bearer error="insufficient_scope"'],
+        },
+      }).authenticationRequired,
+    ).toBeUndefined();
+  });
+
+  it.each([
+    'Bearer error="insufficient_scope"',
+    'Bearer error=insufficient_scope',
+  ])('keeps %s as a permission denial', (challenge) => {
+    expect(
+      serializeDatoMcpToolResult({
+        isError: true,
+        _meta: { 'mcp/www_authenticate': [challenge] },
+      }).authenticationRequired,
+    ).toBeUndefined();
+  });
+
+  it('classifies only HTTP 401 from the dedicated MCP transport as reconnect-required', async () => {
+    const fetcher = createDatoMcpCorsCompatibleFetch(
+      vi
+        .fn()
+        .mockResolvedValueOnce(new Response('', { status: 401 }))
+        .mockResolvedValueOnce(new Response('', { status: 500 }))
+        .mockResolvedValueOnce(new Response('', { status: 403 })),
+    );
+    await expect(fetcher('https://mcp.datocms.com/')).rejects.toMatchObject({
+      code: 'mcp_auth_required',
+    });
+    await expect(fetcher('https://mcp.datocms.com/')).resolves.toMatchObject({
+      status: 500,
+    });
+    await expect(fetcher('https://mcp.datocms.com/')).resolves.toMatchObject({
+      status: 403,
+    });
+  });
+});

@@ -22,15 +22,24 @@ import {
   createOAuthCredentials,
 } from '../lib/credentials';
 import { clearSessionLocalFiles, registerLocalFile } from '../lib/localFiles';
+import { DatoMcpAuthenticationError } from '../lib/mcpAuthentication';
 import type { AgentMentionHost } from '../lib/mentionHost';
 import type {
   AgentComposerSubmission,
   LocalFileMention,
 } from '../lib/mentions';
+import { RemoteMcpOAuthError } from '../lib/oauth';
 import { createUnsafeDispatchJournalStore } from '../lib/unsafeDispatchJournal';
 import AgentFrame, { type AgentFrameProps } from './AgentFrame';
 
 const mocks = vi.hoisted(() => ({
+  whoami: vi.fn(),
+  openPopup: vi.fn(),
+  registerClient: vi.fn(),
+  authorization: vi.fn(),
+  callback: vi.fn(),
+  exchange: vi.fn(),
+  navigatePopup: vi.fn(),
   surfaceProps: undefined as AgentSurfaceProps | undefined,
   runtime: undefined as AgentRuntime | undefined,
   runtimeConfig: undefined as AgentRuntimeConfig | undefined,
@@ -44,6 +53,43 @@ vi.mock('../components/AgentSurface', () => ({
     return <div data-testid="agent-surface" />;
   },
 }));
+
+vi.mock('../lib/datoMcpClient', async (importOriginal) => {
+  const original =
+    await importOriginal<typeof import('../lib/datoMcpClient')>();
+  return {
+    ...original,
+    createDatoMcpClient: (
+      ...args: Parameters<typeof original.createDatoMcpClient>
+    ) => {
+      const client = original.createDatoMcpClient(...args);
+      return {
+        listTools: client.listTools.bind(client),
+        close: client.close.bind(client),
+        callTool: (
+          call: Parameters<typeof client.callTool>[0],
+          signal?: AbortSignal,
+        ) =>
+          call.name === 'whoami'
+            ? mocks.whoami(args[0], signal)
+            : client.callTool(call, signal),
+      };
+    },
+  };
+});
+
+vi.mock('../lib/oauth', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../lib/oauth')>();
+  return {
+    ...original,
+    openOAuthPopup: mocks.openPopup,
+    registerClient: mocks.registerClient,
+    createAuthorizationRequest: mocks.authorization,
+    waitForOAuthCallback: mocks.callback,
+    exchangeAuthorizationCode: mocks.exchange,
+    navigateOAuthPopup: mocks.navigatePopup,
+  };
+});
 
 vi.mock('../lib/agentRuntime', async (importOriginal) => {
   const original = await importOriginal<typeof import('../lib/agentRuntime')>();
@@ -74,7 +120,7 @@ function completedResult(
 }
 
 function props(overrides: Partial<AgentFrameProps> = {}): AgentFrameProps {
-  return {
+  const frameProps: AgentFrameProps = {
     pluginId: 'plugin',
     siteId: 'site',
     siteName: 'Marketing site',
@@ -96,6 +142,12 @@ function props(overrides: Partial<AgentFrameProps> = {}): AgentFrameProps {
     onConfirmEnableAutoApprove: vi.fn().mockResolvedValue(true),
     ...overrides,
   };
+  const store = createCredentialStore({
+    siteId: frameProps.siteId,
+    currentUserId: frameProps.currentUserId,
+  });
+  if (!store.load()) seedDatoConnection(frameProps);
+  return frameProps;
 }
 
 function configForProvider(provider: AgentProvider) {
@@ -632,6 +684,39 @@ async function startApprovalTurn({
 
 describe('AgentFrame', () => {
   beforeEach(() => {
+    mocks.whoami.mockReset().mockResolvedValue({
+      content:
+        '```toon\nemail: editor@example.com\naccess_level: unrestricted\n```',
+      isError: false,
+    });
+    mocks.openPopup
+      .mockReset()
+      .mockImplementation(() => ({ closed: false, close: vi.fn() }));
+    mocks.registerClient
+      .mockReset()
+      .mockImplementation(async (redirectUri: string) => ({
+        clientId: `registered-${mocks.registerClient.mock.calls.length}`,
+        clientIdIssuedAt: 1,
+        redirectUri,
+        registrationVersion: 2,
+      }));
+    mocks.authorization.mockReset().mockImplementation(async () => ({
+      state: `state-${mocks.authorization.mock.calls.length}`,
+      authorizationUrl: 'https://mcp.datocms.com/authorize',
+      expiresAt: Date.now() + 300_000,
+    }));
+    mocks.callback
+      .mockReset()
+      .mockImplementation(async (_popup: Window, state: string) => ({
+        code: `code-${state}`,
+        state,
+      }));
+    mocks.exchange.mockReset().mockResolvedValue({
+      accessToken: 'opaque.bridge/token+value==',
+      tokenType: 'Bearer',
+      obtainedAt: 2,
+    });
+    mocks.navigatePopup.mockReset();
     testUser += 1;
     localStorage.clear();
     sessionStorage.clear();
@@ -702,7 +787,7 @@ describe('AgentFrame', () => {
     expect(openRecord).toHaveBeenCalledOnce();
   });
 
-  it('checkpoints the user message before the provider turn resolves', () => {
+  it('checkpoints the user message before the provider turn resolves', async () => {
     const frameProps = props({
       currentUserId: `immediate-checkpoint-user-${testUser}`,
     });
@@ -722,7 +807,7 @@ describe('AgentFrame', () => {
       mocks.surfaceProps?.onSubmit('Remember this question immediately');
     });
 
-    expect(mocks.runtime?.runTurn).toHaveBeenCalledOnce();
+    // The user message is durable even while the access check is pending.
     expect(store.list()[0]?.messages).toEqual([
       expect.objectContaining({
         role: 'user',
@@ -730,6 +815,7 @@ describe('AgentFrame', () => {
       }),
     ]);
     expect(mocks.surfaceProps?.isRunning).toBe(true);
+    await waitFor(() => expect(mocks.runtime?.runTurn).toHaveBeenCalledOnce());
   });
 
   it('checkpoints a safe in-flight turn before unmount aborts it', async () => {
@@ -3332,6 +3418,9 @@ describe('AgentFrame', () => {
     const frameProps = props();
     render(<AgentFrame {...frameProps} />);
 
+    await waitFor(() =>
+      expect(mocks.surfaceProps?.onAutoApproveChange).toBeDefined(),
+    );
     expect(mocks.surfaceProps?.autoApproveEnabled).toBe(false);
     await act(async () => {
       await mocks.surfaceProps?.onAutoApproveChange?.(true);
@@ -3368,6 +3457,9 @@ describe('AgentFrame', () => {
           onConfirmEnableAutoApprove,
         })}
       />,
+    );
+    await waitFor(() =>
+      expect(mocks.surfaceProps?.onAutoApproveChange).toBeDefined(),
     );
     const change = mocks.surfaceProps?.onAutoApproveChange;
     if (!change) {
@@ -4059,6 +4151,7 @@ describe('AgentFrame', () => {
     act(() => {
       mocks.surfaceProps?.onSubmit('Update this record');
     });
+    await waitFor(() => expect(finishTurn).toBeDefined());
     rerender(<AgentFrame {...cleanProps} editorHasUnsavedChanges />);
     await act(async () => {
       await finishTurn?.();
@@ -7926,5 +8019,570 @@ describe('AgentFrame', () => {
     expect(
       mocks.surfaceProps?.entries.some((entry) => entry.kind === 'assets'),
     ).toBe(false);
+  });
+
+  it.each(['openai', 'anthropic'] as const)(
+    'requires explicit reconnection after a rejected legacy token for %s',
+    async (provider) => {
+      const frameProps = props({ config: configForProvider(provider) });
+      seedDatoConnection(frameProps, 'legacy-token');
+      enableAutoApproval(frameProps);
+      mocks.whoami.mockImplementation(async (token: string) => {
+        if (token === 'legacy-token') throw new DatoMcpAuthenticationError();
+        return {
+          content: '```toon\naccess_level: content_only\n```',
+          isError: false,
+        };
+      });
+      render(<AgentFrame {...frameProps} />);
+      await waitFor(() =>
+        expect(mocks.surfaceProps?.connection.datoCmsStatus).toBe(
+          'mcp_auth_required',
+        ),
+      );
+      const store = createCredentialStore({
+        siteId: frameProps.siteId,
+        currentUserId: frameProps.currentUserId,
+      });
+      expect(store.load()?.credentials.token).toBeUndefined();
+      expect(store.load()?.credentials.client.clientId).toBe('test-client');
+      expect(mocks.surfaceProps?.autoApproveEnabled).toBe(false);
+      expect(mocks.openPopup).not.toHaveBeenCalled();
+      await act(async () => {
+        await mocks.surfaceProps?.onConnectDatoCms?.();
+      });
+      expect(mocks.openPopup).toHaveBeenCalledOnce();
+      expect(mocks.registerClient).toHaveBeenCalledOnce();
+      expect(store.load()?.credentials.token?.accessToken).toBe(
+        'opaque.bridge/token+value==',
+      );
+      expect(mocks.surfaceProps?.connection.datoCmsStatus).toBe('connected');
+      expect(mocks.surfaceProps?.connection.oauthAccessLevel).toBe(
+        'content_only',
+      );
+      expect(mocks.surfaceProps?.autoApproveEnabled).toBe(false);
+      mocks.runtime = {
+        runTurn: vi.fn().mockResolvedValue(completedResult()),
+        dispose: vi.fn(),
+      } as unknown as AgentRuntime;
+      await act(async () => {
+        mocks.surfaceProps?.onSubmit('Read the content');
+      });
+      expect(mocks.runtimeConfig).toMatchObject({
+        provider,
+        mcpAccessToken: 'opaque.bridge/token+value==',
+        mcpAccessLevel: 'content_only',
+      });
+    },
+  );
+
+  it.each([
+    'unknown',
+    'content_view_only',
+    'content_only',
+    'unrestricted',
+  ] as const)(
+    'uses OAuth %s for both plugin Read Only settings',
+    async (level) => {
+      for (const readOnly of [false, true]) {
+        mocks.whoami.mockResolvedValue({
+          content: `\`\`\`toon\naccess_level: ${level}\n\`\`\``,
+          isError: false,
+        });
+        const frameProps = props({
+          currentUserId: `${testUser}-${level}-${readOnly}`,
+          config: { ...DEFAULT_CONFIG, openAiApiKey: 'key', readOnly },
+        });
+        enableAutoApproval(frameProps);
+        const createAsset = vi.fn();
+        frameProps.mentionHost = assetCreatingMentionHost({ createAsset });
+        mocks.runtime = {
+          runTurn: vi.fn().mockResolvedValue(completedResult()),
+        } as unknown as AgentRuntime;
+        const rendered = render(<AgentFrame {...frameProps} />);
+        // biome-ignore lint/performance/noAwaitInLoops: Each permission case has its own runtime and isolated assertions.
+        await waitFor(() =>
+          expect(mocks.surfaceProps?.connection.accessChecking).toBe(false),
+        );
+        await act(async () => {
+          mocks.surfaceProps?.onSubmit('Read this project');
+        });
+        const writable =
+          !readOnly && (level === 'content_only' || level === 'unrestricted');
+        expect(mocks.runtime?.runTurn).toHaveBeenCalledOnce();
+        expect(Boolean(mocks.runtimeConfig?.createDatoAsset)).toBe(writable);
+        expect(mocks.surfaceProps?.autoApproveEnabled).toBe(writable);
+        expect(mocks.surfaceProps?.connection).toMatchObject({
+          oauthAccessLevel: level,
+          pluginReadOnly: readOnly,
+        });
+        expect(createAsset).not.toHaveBeenCalled();
+        rendered.unmount();
+      }
+    },
+  );
+
+  it('reuses a marked registration indefinitely and replaces a legacy registration only during sign-in', async () => {
+    const frameProps = props();
+    const store = createCredentialStore({
+      siteId: frameProps.siteId,
+      currentUserId: frameProps.currentUserId,
+    });
+    render(<AgentFrame {...frameProps} />);
+    await waitFor(() =>
+      expect(mocks.surfaceProps?.connection.oauthAccessLevel).toBe(
+        'unrestricted',
+      ),
+    );
+    expect(mocks.registerClient).not.toHaveBeenCalled();
+    await act(async () => {
+      await mocks.surfaceProps?.onConnectDatoCms?.();
+    });
+    expect(mocks.registerClient).toHaveBeenCalledOnce();
+    expect(store.load()?.credentials.client.registrationVersion).toBe(2);
+    await act(async () => {
+      await mocks.surfaceProps?.onConnectDatoCms?.();
+    });
+    expect(mocks.registerClient).toHaveBeenCalledOnce();
+    expect(mocks.authorization).toHaveBeenCalledTimes(2);
+  });
+
+  it('restarts invalid-client token exchange once with a fresh registration, code, and state', async () => {
+    const frameProps = props();
+    mocks.exchange.mockRejectedValueOnce(
+      new RemoteMcpOAuthError('Invalid client', { code: 'invalid_client' }),
+    );
+    render(<AgentFrame {...frameProps} />);
+    await act(async () => {
+      await mocks.surfaceProps?.onConnectDatoCms?.();
+    });
+    expect(mocks.openPopup).toHaveBeenCalledOnce();
+    expect(mocks.registerClient).toHaveBeenCalledTimes(2);
+    expect(mocks.exchange.mock.calls.map(([args]) => args.state)).toEqual([
+      'state-1',
+      'state-2',
+    ]);
+    expect(mocks.exchange.mock.calls.map(([args]) => args.code)).toEqual([
+      'code-state-1',
+      'code-state-2',
+    ]);
+    expect(mocks.surfaceProps?.connection.datoCmsStatus).toBe('connected');
+  });
+
+  it('bounds invalid-client recovery and discards the rejected registration', async () => {
+    const frameProps = props();
+    mocks.callback.mockRejectedValue(
+      new RemoteMcpOAuthError('Invalid client', { code: 'invalid_client' }),
+    );
+    render(<AgentFrame {...frameProps} />);
+    await act(async () => {
+      await mocks.surfaceProps?.onConnectDatoCms?.();
+    });
+    expect(mocks.registerClient).toHaveBeenCalledTimes(2);
+    expect(mocks.exchange).not.toHaveBeenCalled();
+    expect(
+      createCredentialStore({
+        siteId: frameProps.siteId,
+        currentUserId: frameProps.currentUserId,
+      }).load(),
+    ).toBeNull();
+    expect(mocks.surfaceProps?.connection.datoCmsError).toContain(
+      'Invalid client',
+    );
+  });
+
+  it('requires a fresh authorization after invalid_grant without replaying the consumed code', async () => {
+    const frameProps = props();
+    mocks.exchange.mockRejectedValueOnce(
+      new RemoteMcpOAuthError('Invalid grant', { code: 'invalid_grant' }),
+    );
+    render(<AgentFrame {...frameProps} />);
+    await act(async () => {
+      await mocks.surfaceProps?.onConnectDatoCms?.();
+    });
+    expect(mocks.exchange).toHaveBeenCalledOnce();
+    expect(mocks.surfaceProps?.connection.datoCmsError).toContain(
+      'Start sign-in again',
+    );
+    await act(async () => {
+      await mocks.surfaceProps?.onConnectDatoCms?.();
+    });
+    expect(mocks.registerClient).toHaveBeenCalledOnce();
+    expect(mocks.exchange.mock.calls.map(([args]) => args.code)).toEqual([
+      'code-state-1',
+      'code-state-2',
+    ]);
+  });
+
+  it('offers an explicit fresh-registration retry after no callback can be returned', async () => {
+    mocks.callback.mockRejectedValueOnce(
+      new Error('The sign-in popup was closed before authorization completed'),
+    );
+    render(<AgentFrame {...props()} />);
+    await act(async () => {
+      await mocks.surfaceProps?.onConnectDatoCms?.();
+    });
+    expect(mocks.registerClient).toHaveBeenCalledOnce();
+    await act(async () => {
+      await mocks.surfaceProps?.onRestartDatoCmsConnection?.();
+    });
+    expect(mocks.openPopup).toHaveBeenCalledTimes(2);
+    expect(mocks.registerClient).toHaveBeenCalledTimes(2);
+    expect(mocks.surfaceProps?.connection.datoCmsStatus).toBe('connected');
+  });
+
+  it.each(['unknown', 'content_view_only', 'content_only'] as const)(
+    'invalidates a pending approval when access narrows to %s',
+    async (level) => {
+      render(<AgentFrame {...props()} />);
+      await startApprovalTurn();
+      const entry = mocks.surfaceProps?.entries.find(
+        (entry) => entry.kind === 'approval',
+      );
+      if (entry?.kind !== 'approval') throw new Error('Expected approval');
+      const oldApprove = mocks.surfaceProps?.onApproveUnsafeAction;
+      mocks.whoami.mockResolvedValue({
+        content: `\`\`\`toon\naccess_level: ${level}\n\`\`\``,
+        isError: false,
+      });
+      await act(async () => {
+        mocks.surfaceProps?.onCheckDatoCmsAccess?.();
+      });
+      await waitFor(() =>
+        expect(mocks.surfaceProps?.connection.oauthAccessLevel).toBe(level),
+      );
+      await act(async () => {
+        await oldApprove?.(entry.approval);
+      });
+      expect(mocks.runtime?.submitApprovals).not.toHaveBeenCalled();
+      expect(
+        mocks.surfaceProps?.entries.filter(
+          (candidate) =>
+            candidate.kind === 'approval' &&
+            candidate.approval.status === 'pending',
+        ),
+      ).toHaveLength(0);
+      expect(mocks.surfaceProps?.composerDisabled).toBe(false);
+    },
+  );
+
+  it('cancels and clears the armed journal if authentication expires immediately before dispatch', async () => {
+    const frameProps = props();
+    render(<AgentFrame {...frameProps} />);
+    await startApprovalTurn();
+    const dispatched = vi.fn();
+    const submitApprovals = vi.fn(async (args: ContinueApprovalsArgs) => {
+      await args.unsafeDispatchCallbacks?.prepareDispatch?.(
+        ['approval_1'],
+        args.signal,
+      );
+      args.unsafeDispatchCallbacks?.beforeDispatch(['approval_1']);
+      dispatched();
+      return completedResult();
+    });
+    if (mocks.runtime) mocks.runtime.submitApprovals = submitApprovals;
+    const entry = mocks.surfaceProps?.entries.find(
+      (entry) => entry.kind === 'approval',
+    );
+    if (entry?.kind !== 'approval') throw new Error('Expected approval');
+    mocks.whoami.mockRejectedValue(new DatoMcpAuthenticationError());
+    await act(async () => {
+      await mocks.surfaceProps?.onApproveUnsafeAction?.(entry.approval);
+    });
+    expect(submitApprovals).toHaveBeenCalledOnce();
+    expect(dispatched).not.toHaveBeenCalled();
+    expect(
+      createUnsafeDispatchJournalStore({
+        pluginId: frameProps.pluginId,
+        siteId: frameProps.siteId,
+        environment: frameProps.environment,
+        currentUserId: frameProps.currentUserId,
+        scope: frameProps.scope,
+      }).read(),
+    ).toBeUndefined();
+    expect(mocks.surfaceProps?.connection.datoCmsStatus).toBe(
+      'mcp_auth_required',
+    );
+    expect(
+      mocks.surfaceProps?.entries.some(
+        (candidate) =>
+          candidate.kind === 'approval' &&
+          candidate.approval.error?.includes('may have run'),
+      ),
+    ).toBe(false);
+  });
+
+  it('rejects a stale sign-in result after another frame replaces credentials', async () => {
+    const frameProps = props();
+    const store = createCredentialStore({
+      siteId: frameProps.siteId,
+      currentUserId: frameProps.currentUserId,
+    });
+    let resolveToken:
+      | ((token: {
+          accessToken: string;
+          tokenType: string;
+          obtainedAt: number;
+        }) => void)
+      | undefined;
+    mocks.exchange.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveToken = resolve;
+        }),
+    );
+    render(<AgentFrame {...frameProps} />);
+    act(() => {
+      mocks.surfaceProps?.onConnectDatoCms?.();
+    });
+    await waitFor(() => expect(resolveToken).toBeDefined());
+    await act(async () => {
+      seedDatoConnection(frameProps, 'replacement-from-other-frame');
+      window.dispatchEvent(
+        new StorageEvent('storage', {
+          key: store.key,
+          storageArea: localStorage,
+        }),
+      );
+    });
+    await act(async () => {
+      resolveToken?.({
+        accessToken: 'stale-login-token',
+        tokenType: 'Bearer',
+        obtainedAt: 9,
+      });
+    });
+    expect(store.load()?.credentials.token?.accessToken).toBe(
+      'replacement-from-other-frame',
+    );
+    expect(mocks.surfaceProps?.connection.datoCmsStatus).toBe('connected');
+    expect(mocks.surfaceProps?.connection.accessChecking).toBe(false);
+  });
+
+  it('preserves conversation messages and attachment bytes while reconnecting and clears provider continuation', async () => {
+    const frameProps = props();
+    const store = createConversationStore({
+      pluginId: frameProps.pluginId,
+      siteId: frameProps.siteId,
+      environment: frameProps.environment,
+      currentUserId: frameProps.currentUserId,
+      scope: frameProps.scope,
+    });
+    const file = new File(['brief'], 'brief.txt', { type: 'text/plain' });
+    const local = registerLocalFile(file);
+    const conversation = storedConversation({
+      id: 'preserved',
+      title: 'My conversation',
+      updatedAt: '2026-09-14T10:00:00.000Z',
+      previousResponseId: 'old-response',
+      responseProvider: 'openai',
+      responseModel: frameProps.config.model,
+    });
+    store.save(conversation);
+    mocks.whoami.mockRejectedValueOnce(new DatoMcpAuthenticationError());
+    render(<AgentFrame {...frameProps} />);
+    await waitFor(() =>
+      expect(mocks.surfaceProps?.connection.datoCmsStatus).toBe(
+        'mcp_auth_required',
+      ),
+    );
+    expect(store.list()[0].messages).toEqual(conversation.messages);
+    expect(store.list()[0].previousResponseId).toBeUndefined();
+    await act(async () => {
+      await mocks.surfaceProps?.onConnectDatoCms?.();
+    });
+    expect(store.list()[0].messages).toEqual(conversation.messages);
+    mocks.runtime = {
+      runTurn: vi.fn().mockResolvedValue(completedResult()),
+    } as unknown as AgentRuntime;
+    await act(async () => {
+      mocks.surfaceProps?.onSubmit(localFileSubmission(local));
+    });
+    expect(mocks.runtime?.runTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attachments: [expect.objectContaining({ file })],
+      }),
+      expect.any(Function),
+    );
+    expect(frameProps.config.openAiApiKey).toBe('sk-test-key');
+  });
+
+  it('does not restore Auto-approve when access widens again', async () => {
+    const frameProps = props();
+    enableAutoApproval(frameProps);
+    render(<AgentFrame {...frameProps} />);
+    await waitFor(() =>
+      expect(mocks.surfaceProps?.connection.oauthAccessLevel).toBe(
+        'unrestricted',
+      ),
+    );
+    mocks.whoami.mockResolvedValueOnce({
+      content: '```toon\naccess_level: content_view_only\n```',
+      isError: false,
+    });
+    await act(async () => {
+      mocks.surfaceProps?.onCheckDatoCmsAccess?.();
+    });
+    await waitFor(() =>
+      expect(mocks.surfaceProps?.autoApproveEnabled).toBe(false),
+    );
+    await act(async () => {
+      mocks.surfaceProps?.onCheckDatoCmsAccess?.();
+    });
+    expect(mocks.surfaceProps?.connection.oauthAccessLevel).toBe(
+      'unrestricted',
+    );
+    expect(mocks.surfaceProps?.autoApproveEnabled).toBe(false);
+  });
+
+  it.each(['unknown', 'content_view_only', 'content_only'] as const)(
+    'retires repair candidates when access narrows to %s',
+    async (level) => {
+      const { runTurn } = configureApprovalOutcomeRuntime({
+        outcome: repairableApprovalOutcome(),
+      });
+      render(<AgentFrame {...props()} />);
+      await submitAndApproveCurrentOperation();
+      await waitFor(() =>
+        expect(
+          mocks.surfaceProps?.entries.some(
+            (candidate) =>
+              candidate.kind === 'approval' &&
+              candidate.approval.recovery?.status === 'available',
+          ),
+        ).toBe(true),
+      );
+      const entry = mocks.surfaceProps?.entries.find(
+        (candidate) =>
+          candidate.kind === 'approval' &&
+          candidate.approval.recovery?.status === 'available',
+      );
+      if (entry?.kind !== 'approval')
+        throw new Error('Expected repair candidate');
+      mocks.whoami.mockResolvedValue({
+        content: `\`\`\`toon\naccess_level: ${level}\n\`\`\``,
+        isError: false,
+      });
+      await act(async () => {
+        mocks.surfaceProps?.onCheckDatoCmsAccess?.();
+      });
+      await act(async () => {
+        await mocks.surfaceProps?.onRepairUnsafeAction?.(entry.approval);
+      });
+      expect(runTurn).toHaveBeenCalledOnce();
+      expect(
+        mocks.surfaceProps?.entries.some(
+          (candidate) =>
+            candidate.kind === 'approval' &&
+            candidate.approval.recovery?.status === 'available',
+        ),
+      ).toBe(false);
+    },
+  );
+
+  it.each([false, true])(
+    'blocks a newly restricted write at the access boundary with Auto-approve %s',
+    async (automatic) => {
+      const frameProps = props();
+      if (automatic) enableAutoApproval(frameProps);
+      const dispatched = vi.fn();
+      const proposal = completedResult({
+        status: 'approval_required',
+        responseId: 'approval',
+        approvals: [unsafeApproval],
+      });
+      const submitApprovals = vi.fn(async (args: ContinueApprovalsArgs) => {
+        mocks.whoami.mockResolvedValue({
+          content: '```toon\naccess_level: content_view_only\n```',
+          isError: false,
+        });
+        await args.unsafeDispatchCallbacks?.prepareDispatch?.(
+          [unsafeApproval.approvalRequestId],
+          args.signal,
+        );
+        args.unsafeDispatchCallbacks?.beforeDispatch([
+          unsafeApproval.approvalRequestId,
+        ]);
+        dispatched();
+        return completedResult();
+      });
+      mocks.runtime = {
+        runTurn: vi.fn(
+          async (_args: unknown, onEvent?: RuntimeEventObserver) => {
+            await onEvent?.({
+              type: 'approval_required',
+              responseId: 'approval',
+              approval: unsafeApproval,
+            });
+            await onEvent?.({ type: 'turn_completed', result: proposal });
+            return proposal;
+          },
+        ),
+        submitApprovals,
+      } as unknown as AgentRuntime;
+      render(<AgentFrame {...frameProps} />);
+      await act(async () => {
+        mocks.surfaceProps?.onSubmit('Update the title');
+      });
+      if (!automatic) {
+        const entry = mocks.surfaceProps?.entries.find(
+          (candidate) => candidate.kind === 'approval',
+        );
+        if (entry?.kind !== 'approval') throw new Error('Expected approval');
+        await act(async () => {
+          await mocks.surfaceProps?.onApproveUnsafeAction?.(entry.approval);
+        });
+      }
+      await waitFor(() => expect(submitApprovals).toHaveBeenCalledOnce());
+      expect(dispatched).not.toHaveBeenCalled();
+      expect(mocks.surfaceProps?.autoApproveEnabled).toBe(false);
+      expect(mocks.surfaceProps?.connection.datoCmsStatus).toBe('connected');
+      expect(mocks.surfaceProps?.connection.oauthAccessLevel).toBe(
+        'content_view_only',
+      );
+    },
+  );
+
+  it('rechecks OAuth after the native asset confirmation and blocks a narrowed local upload', async () => {
+    const uploaded = vi.fn();
+    const createAsset = vi.fn<NonNullable<AgentMentionHost['createAsset']>>(
+      async (_input, options) => {
+        // The CMS confirmation has returned, but the upload has not started.
+        mocks.whoami.mockResolvedValue({
+          content: '```toon\naccess_level: content_view_only\n```',
+          isError: false,
+        });
+        await options?.prepareUploadDispatch?.();
+        options?.onUploadDispatch?.();
+        uploaded();
+        return createdAssetMention('uploaded', 'brief.txt');
+      },
+    );
+    mocks.runtime = {
+      runTurn: vi.fn(() => new Promise(() => undefined)),
+    } as unknown as AgentRuntime;
+    render(
+      <AgentFrame
+        {...props({ mentionHost: assetCreatingMentionHost({ createAsset }) })}
+      />,
+    );
+    await act(async () => {
+      mocks.surfaceProps?.onSubmit('Create an asset from this URL');
+    });
+    const createDatoAsset = mocks.runtimeConfig?.createDatoAsset;
+    if (!createDatoAsset) throw new Error('Expected local asset tool');
+    await act(async () => {
+      await expect(
+        createDatoAsset({
+          source: 'url',
+          url: 'https://example.com/brief.txt',
+        }),
+      ).rejects.toThrow('only permits reading');
+    });
+    expect(createAsset).toHaveBeenCalledOnce();
+    expect(uploaded).not.toHaveBeenCalled();
+    expect(mocks.surfaceProps?.connection.oauthAccessLevel).toBe(
+      'content_view_only',
+    );
   });
 });

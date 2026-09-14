@@ -38,3 +38,13 @@ and prepare content changes.
   is enabled.
 - The provider API key is configured for the project. Your DatoCMS connection
   and recent chats are stored in your browser.
+
+- The plugin's Read Only setting, OAuth access level, and project role all apply.
+  **Only read content** disables every agent write, including local asset creation.
+  **Read and edit content** permits content changes while schema and management
+  restrictions remain enforced by Remote MCP.
+- If access cannot be verified, reads remain available and writes pause. Use
+  **Check access again** to refresh it. A narrower access level invalidates pending
+  write approvals; Auto-approve stays off after writes become available again.
+- If authentication expires, click **Reconnect DatoCMS**. Chat history and local
+  attachments stay available. Reconnection never repeats an uncertain write.

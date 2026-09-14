@@ -57,6 +57,11 @@ import {
   type CreateDatoAssetCallback,
   parseCreateDatoAssetInput,
 } from './localAssetTool';
+import { agentWritesAllowed, type McpAccessLevel } from './mcpAccess';
+import {
+  DatoMcpAuthenticationError,
+  mcpAuthenticationChallenges,
+} from './mcpAuthentication';
 import {
   createDatoCmsMcpTool,
   DATOCMS_MCP_SERVER_LABEL,
@@ -596,6 +601,8 @@ export interface AgentRuntimeConfig {
   provider?: AgentProvider;
   apiKey?: string;
   mcpAccessToken: string;
+  mcpAccessLevel?: McpAccessLevel;
+  verifyMcpConnection?: (signal?: AbortSignal) => Promise<void>;
   context: AgentSystemContext;
   navigation: AgentNavigationCallbacks;
   model?: string;
@@ -734,12 +741,14 @@ export interface AgentRuntimeError {
   code:
     | 'aborted'
     | 'api_error'
+    | 'mcp_auth_required'
     | 'incomplete'
     | 'continuation_limit'
     | 'invalid_request'
     | 'unsafe_outcome_unknown';
   message: string;
   retryable: boolean;
+  mcpAuthRequired?: boolean;
 }
 
 export type AgentTurnStatus =
@@ -832,6 +841,11 @@ export interface AgentConversationHistoryMessage {
 }
 
 export interface UnsafeApprovalDispatchCallbacks {
+  /** Await access verification before the synchronous final dispatch guard. */
+  prepareDispatch?(
+    approvalRequestIds: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<void>;
   /**
    * Runs synchronously immediately before an approved unsafe request crosses
    * the network boundary. Throwing prevents that request from being sent.
@@ -1292,6 +1306,7 @@ interface RunLoopArgs {
   state: OpenAiLoopState;
   signal?: AbortSignal;
   onRequestDispatch?: () => void;
+  onRequestPrepare?: () => Promise<void>;
   onApprovedCallsSettled?: (approvalRequestIds: readonly string[]) => void;
 }
 
@@ -2833,6 +2848,19 @@ function classifyProviderFailure(
   };
 }
 
+function mcpCallNeedsConnectionCheck(
+  call: ResponseOutputItem.McpCall,
+): boolean {
+  if (call.error || call.status === 'failed') return true;
+  if (mcpAuthenticationChallenges(call).length > 0) return true;
+  if (typeof call.output !== 'string') return false;
+  try {
+    return mcpAuthenticationChallenges(JSON.parse(call.output)).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function runtimeFailure(
   provider: ProviderRuntimeName,
   cause: unknown,
@@ -2840,6 +2868,14 @@ function runtimeFailure(
 ): AgentRuntimeError {
   const providerCause =
     cause instanceof ProviderRequestFailure ? cause.providerCause : cause;
+  if (providerCause instanceof DatoMcpAuthenticationError) {
+    return {
+      code: 'mcp_auth_required',
+      message: providerCause.message,
+      retryable: false,
+      mcpAuthRequired: true,
+    };
+  }
   if (isAbortError(providerCause, signal)) {
     return {
       code: 'aborted',
@@ -3317,6 +3353,11 @@ export class AgentRuntime implements AgentRuntimeHandle {
   private readonly reasoningEffort: ReasoningEffort;
   private readonly fastMode: boolean;
   private readonly readOnly: boolean;
+  private readonly pluginReadOnly: boolean;
+  private readonly mcpAccessLevel?: McpAccessLevel;
+  private readonly verifyMcpConnection?: (
+    signal?: AbortSignal,
+  ) => Promise<void>;
   private readonly additionalInstructions?: string;
   private readonly hostContext?: string;
   private readonly getModelSchema?: GetModelSchemaCallback;
@@ -3333,7 +3374,13 @@ export class AgentRuntime implements AgentRuntimeHandle {
     this.fastMode =
       Boolean(config.fastMode) &&
       providerModelSupportsFastMode('openai', this.model);
-    this.readOnly = Boolean(config.readOnly);
+    this.pluginReadOnly = Boolean(config.readOnly);
+    this.mcpAccessLevel = config.mcpAccessLevel;
+    this.readOnly = !agentWritesAllowed(
+      this.pluginReadOnly,
+      config.mcpAccessLevel ?? 'unrestricted',
+    );
+    this.verifyMcpConnection = config.verifyMcpConnection;
     this.additionalInstructions =
       config.additionalInstructions?.trim().slice(0, 10_000) || undefined;
     this.hostContext = normalizeHostContext(config.hostContext);
@@ -3604,6 +3651,13 @@ export class AgentRuntime implements AgentRuntimeHandle {
       previousResponseId: responseId,
       state,
       signal: args.signal,
+      onRequestPrepare: async () => {
+        if (!dispatched && approvedUnsafeOperation)
+          await args.unsafeDispatchCallbacks?.prepareDispatch?.(
+            approvedIds,
+            args.signal,
+          );
+      },
       onRequestDispatch: () => {
         if (!dispatched && approvedUnsafeOperation) {
           args.unsafeDispatchCallbacks?.beforeDispatch(approvedIds);
@@ -3696,6 +3750,7 @@ export class AgentRuntime implements AgentRuntimeHandle {
         }
         const error: AgentRuntimeError = {
           code: 'unsafe_outcome_unknown',
+          ...(result.error?.mcpAuthRequired ? { mcpAuthRequired: true } : {}),
           message:
             'The approved DatoCMS change may have run, but its result could not be confirmed. Verify the affected content before trying another write.',
           retryable: false,
@@ -3795,7 +3850,8 @@ export class AgentRuntime implements AgentRuntimeHandle {
       ...(this.fastMode ? { service_tier: 'priority' } : {}),
       instructions: buildSystemPrompt(this.context, {
         additionalInstructions: this.additionalInstructions,
-        readOnly: this.readOnly,
+        readOnly: this.pluginReadOnly,
+        mcpAccessLevel: this.mcpAccessLevel,
       }),
       input,
       ...(previousResponseId
@@ -3832,6 +3888,7 @@ export class AgentRuntime implements AgentRuntimeHandle {
     state,
     signal,
     onRequestDispatch,
+    onRequestPrepare,
     onApprovedCallsSettled,
   }: RunLoopArgs): AsyncGenerator<AgentRuntimeEvent, AgentTurnResult> {
     let input = initialInput;
@@ -3852,6 +3909,7 @@ export class AgentRuntime implements AgentRuntimeHandle {
             onRequestDispatch,
             state.approvalCorrelations,
             state.repairPolicy?.scriptName,
+            onRequestPrepare,
           );
         } catch (cause) {
           if (cause instanceof OpenAiStreamTerminalError) {
@@ -4215,10 +4273,25 @@ export class AgentRuntime implements AgentRuntimeHandle {
       ApprovedCallCorrelation
     > = new Map(),
     protectedRepairScriptName?: string,
+    onRequestPrepare?: () => Promise<void>,
   ): AsyncGenerator<AgentRuntimeEvent, SingleResponseSummary> {
     throwIfAborted(signal);
+    if (onRequestPrepare) await onRequestPrepare();
+    throwIfAborted(signal);
+    // No await or event yield may separate this guard/journal from dispatch.
     onRequestDispatch?.();
-    const stream = await this.client.create(request, { signal });
+    let stream: Awaited<ReturnType<AgentResponsesClient['create']>>;
+    try {
+      stream = await this.client.create(request, { signal });
+    } catch (cause) {
+      if (
+        providerErrorStatus(cause) === 424 ||
+        /mcp/i.test(providerErrorCode(cause) ?? '')
+      ) {
+        await this.verifyMcpConnection?.(signal);
+      }
+      throw cause;
+    }
     let responseId = '';
     let response: Response | undefined;
     let text = '';
@@ -4226,6 +4299,12 @@ export class AgentRuntime implements AgentRuntimeHandle {
     const approvals = new Map<string, AgentApprovalRequest>();
     const functionCalls = new Map<string, ResponseFunctionToolCall>();
     const mcpCalls = new Map<string, ResponseOutputItem.McpCall>();
+    const checkedConnectionItems = new Set<string>();
+    const checkMcpConnection = async (id: string) => {
+      if (checkedConnectionItems.has(id)) return;
+      checkedConnectionItems.add(id);
+      await this.verifyMcpConnection?.(signal);
+    };
 
     const settleReasoning = (status: 'completed' | 'failed' = 'completed') => {
       if (!reasoningActive) {
@@ -4426,6 +4505,7 @@ export class AgentRuntime implements AgentRuntimeHandle {
             break;
 
           case 'response.mcp_list_tools.failed':
+            await checkMcpConnection(event.item_id);
             yield {
               type: 'activity',
               ...(responseId ? { responseId } : {}),
@@ -4453,6 +4533,8 @@ export class AgentRuntime implements AgentRuntimeHandle {
             collectItem(event.item);
             if (event.item.type === 'mcp_call') {
               const mcpError = normalizeMcpError(event.item.error);
+              if (mcpCallNeedsConnectionCheck(event.item))
+                await checkMcpConnection(event.item.id);
               const parsedArguments = parseArguments(event.item.arguments);
               const status =
                 mcpError || event.item.status === 'failed'
@@ -4636,12 +4718,37 @@ export class AgentRuntime implements AgentRuntimeHandle {
       }
     } catch (cause) {
       streamFailure = cause;
+      if (
+        providerErrorStatus(cause) === 424 ||
+        /mcp/i.test(providerErrorCode(cause) ?? '')
+      ) {
+        try {
+          await checkMcpConnection('stream-error');
+        } catch (error) {
+          streamFailure = error;
+        }
+      }
     }
 
     if (response) {
       responseId ||= response.id;
+      if (/mcp/i.test(response.error?.code ?? '')) {
+        try {
+          await checkMcpConnection(response.id);
+        } catch (error) {
+          streamFailure = error;
+        }
+      }
       for (const item of response.output) {
         collectItem(item);
+        if (item.type === 'mcp_call' && mcpCallNeedsConnectionCheck(item)) {
+          try {
+            // biome-ignore lint/performance/noAwaitInLoops: Preserve streamed result order while checking authentication once per tool result.
+            await checkMcpConnection(item.id);
+          } catch (error) {
+            streamFailure = error;
+          }
+        }
       }
     }
 
@@ -5142,10 +5249,12 @@ function anthropicSystemPrompt(
   injectHostContext: boolean,
   readOnly: boolean,
   repairContext: AgentRepairContext | undefined,
+  mcpAccessLevel?: McpAccessLevel,
 ): string {
   const base = buildSystemPrompt(context, {
     additionalInstructions,
     readOnly,
+    mcpAccessLevel,
   });
   const hostMetadata =
     injectHostContext && hostContext
@@ -5210,6 +5319,8 @@ export class AnthropicAgentRuntime implements AgentRuntimeHandle {
   private readonly reasoningEffort: AnthropicReasoningEffort;
   private readonly fastMode: boolean;
   private readonly readOnly: boolean;
+  private readonly pluginReadOnly: boolean;
+  private readonly mcpAccessLevel?: McpAccessLevel;
   private readonly maxOutputTokens: number;
   private readonly additionalInstructions?: string;
   private readonly hostContext?: string;
@@ -5231,7 +5342,12 @@ export class AnthropicAgentRuntime implements AgentRuntimeHandle {
     this.fastMode =
       Boolean(config.fastMode) &&
       providerModelSupportsFastMode('anthropic', this.model);
-    this.readOnly = Boolean(config.readOnly);
+    this.pluginReadOnly = Boolean(config.readOnly);
+    this.mcpAccessLevel = config.mcpAccessLevel;
+    this.readOnly = !agentWritesAllowed(
+      this.pluginReadOnly,
+      config.mcpAccessLevel ?? 'unrestricted',
+    );
     this.maxOutputTokens = resolveAnthropicMaxOutputTokens(
       this.reasoningEffort,
       config.modelMaxOutputTokens,
@@ -5303,8 +5419,9 @@ export class AnthropicAgentRuntime implements AgentRuntimeHandle {
             this.additionalInstructions,
             this.hostContext,
             Boolean(args.injectHostContext),
-            this.readOnly,
+            this.pluginReadOnly,
             repairContext,
+            this.mcpAccessLevel,
           ),
           usesFiles: prepared.usesFiles,
           accumulatedText: '',
@@ -5545,6 +5662,12 @@ export class AnthropicAgentRuntime implements AgentRuntimeHandle {
           continue;
         }
 
+        // biome-ignore lint/performance/noAwaitInLoops: Each write needs fresh access after the preceding operation settles.
+        await args.unsafeDispatchCallbacks?.prepareDispatch?.(
+          [id],
+          args.signal,
+        );
+        throwIfAborted(args.signal);
         args.unsafeDispatchCallbacks?.beforeDispatch([id]);
         unsafeDispatched = true;
         unsafeSettled = false;
@@ -5563,8 +5686,9 @@ export class AnthropicAgentRuntime implements AgentRuntimeHandle {
           approvalActivityCall(id, entry.call),
           'in_progress',
         );
-        // biome-ignore lint/performance/noAwaitInLoops: Unsafe changes are deliberately dispatched one at a time so each exact reviewed call has an unambiguous outcome.
         const remoteResult = await remoteResultPromise;
+        if (remoteResult.authenticationRequired)
+          throw new DatoMcpAuthenticationError();
         unsafeSettled = true;
         state.confirmedApprovalIds.push(id);
         try {
@@ -5705,6 +5829,9 @@ export class AnthropicAgentRuntime implements AgentRuntimeHandle {
         pending.phase = 'outcome_unknown';
         const error: AgentRuntimeError = {
           code: 'unsafe_outcome_unknown',
+          ...(cause instanceof DatoMcpAuthenticationError
+            ? { mcpAuthRequired: true }
+            : {}),
           message:
             'The approved DatoCMS change may have run, but its result could not be confirmed. Verify the affected content before trying another write.',
           retryable: false,
@@ -6296,6 +6423,7 @@ export class AnthropicAgentRuntime implements AgentRuntimeHandle {
         },
         signal,
       );
+      if (result.authenticationRequired) throw new DatoMcpAuthenticationError();
       const toolResult = this.toolResult(
         state,
         toolUse.id,
@@ -6313,7 +6441,10 @@ export class AnthropicAgentRuntime implements AgentRuntimeHandle {
       );
       return toolResult;
     } catch (cause) {
-      if (isAbortError(cause, signal)) {
+      if (
+        cause instanceof DatoMcpAuthenticationError ||
+        isAbortError(cause, signal)
+      ) {
         throw cause;
       }
       const message = safeErrorMessage(cause);

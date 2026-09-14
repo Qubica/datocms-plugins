@@ -3,6 +3,7 @@ import type {
   OAuthAccessToken,
   OAuthClientCredentials,
 } from './credentials';
+import { OAUTH_CLIENT_REGISTRATION_VERSION } from './credentials';
 
 export const MCP_BASE_URL = 'https://mcp.datocms.com';
 export const OAUTH_SCOPES = 'read_account read_sites read_organizations';
@@ -72,6 +73,7 @@ export type OAuthPopupOptions = {
 };
 
 export type WaitForOAuthCallbackOptions = {
+  closeOnSuccess?: boolean;
   hostWindow?: Pick<
     Window,
     | 'addEventListener'
@@ -88,17 +90,20 @@ export type WaitForOAuthCallbackOptions = {
 export type PostOAuthCallbackOptions = {
   url?: string | URL;
   opener?: Pick<Window, 'postMessage'> | null;
-  close?: () => void;
-  schedule?: (callback: () => void, delay: number) => unknown;
 };
 
 export class RemoteMcpOAuthError extends Error {
   readonly status?: number;
+  readonly code?: string;
 
-  constructor(message: string, options: { status?: number } = {}) {
+  constructor(
+    message: string,
+    options: { status?: number; code?: string } = {},
+  ) {
     super(message);
     this.name = 'RemoteMcpOAuthError';
     this.status = options.status;
+    this.code = options.code;
   }
 }
 
@@ -168,7 +173,7 @@ export async function registerClient(
   });
 
   if (!response.ok) {
-    throw httpError('Dynamic client registration', response);
+    throw await httpError('Dynamic client registration', response);
   }
 
   const data = await readJsonObject(response, 'client registration');
@@ -180,6 +185,7 @@ export async function registerClient(
 
   return {
     clientId: data.client_id,
+    registrationVersion: OAUTH_CLIENT_REGISTRATION_VERSION,
     clientIdIssuedAt: isFiniteNonNegativeNumber(data.client_id_issued_at)
       ? data.client_id_issued_at
       : Math.floor((options.now ?? Date.now)() / 1000),
@@ -228,6 +234,7 @@ export async function createAuthorizationRequest(
   const params = new URLSearchParams({
     client_id: args.clientId,
     response_type: 'code',
+    resource: MCP_BASE_URL,
     redirect_uri: redirectUri,
     code_challenge: codeChallenge,
     code_challenge_method: 'S256',
@@ -341,6 +348,7 @@ export function waitForOAuthCallback(
             reject(
               new RemoteMcpOAuthError(
                 `OAuth authorization failed (${callback.error})${description}`,
+                { code: callback.error },
               ),
             ),
           false,
@@ -348,7 +356,10 @@ export function waitForOAuthCallback(
         return;
       }
 
-      settle(() => resolve({ code: callback.code, state: callback.state }));
+      settle(
+        () => resolve({ code: callback.code, state: callback.state }),
+        options.closeOnSuccess !== false,
+      );
     };
 
     hostWindow.addEventListener('message', onMessage);
@@ -437,11 +448,8 @@ export function postOAuthCallbackToOpener(
   };
   opener.postMessage(message, url.origin);
 
-  const close = options.close ?? (() => window.close());
-  const schedule =
-    options.schedule ??
-    ((callback, delay) => window.setTimeout(callback, delay));
-  schedule(close, 50);
+  // The opener owns the popup until the token exchange finishes. Closing here
+  // would prevent bounded invalid_client recovery from reusing the same popup.
   return true;
 }
 
@@ -476,6 +484,7 @@ export async function exchangeAuthorizationCode(
   });
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
+    resource: MCP_BASE_URL,
     code: args.code,
     client_id: pending.clientId,
     code_verifier: pending.codeVerifier,
@@ -493,7 +502,7 @@ export async function exchangeAuthorizationCode(
   );
 
   if (!response.ok) {
-    throw httpError('OAuth token exchange', response);
+    throw await httpError('OAuth token exchange', response);
   }
 
   const data = await readJsonObject(response, 'token exchange');
@@ -547,7 +556,7 @@ export async function revokeToken(
   );
 
   if (!response.ok) {
-    throw httpError('OAuth token revocation', response);
+    throw await httpError('OAuth token revocation', response);
   }
 }
 
@@ -748,10 +757,25 @@ async function readJsonObject(
   return value;
 }
 
-function httpError(action: string, response: Response): RemoteMcpOAuthError {
+async function httpError(
+  action: string,
+  response: Response,
+): Promise<RemoteMcpOAuthError> {
+  let code: string | undefined;
+  try {
+    const body: unknown = await response.json();
+    if (
+      isRecord(body) &&
+      typeof body.error === 'string' &&
+      /^[a-z_]+$/.test(body.error)
+    )
+      code = body.error;
+  } catch {
+    /* Error bodies can be empty or HTML. */
+  }
   return new RemoteMcpOAuthError(
-    `${action} failed with HTTP ${response.status}`,
-    { status: response.status },
+    `${action} failed with HTTP ${response.status}${code ? ` (${code})` : ''}`,
+    { status: response.status, code },
   );
 }
 

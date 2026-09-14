@@ -1,6 +1,5 @@
 export const OAUTH_CREDENTIALS_VERSION = 1 as const;
-export const OAUTH_CLIENT_REGISTRATION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-export const OAUTH_CLIENT_REGISTRATION_SAFETY_MARGIN_MS = 60 * 60 * 1000;
+export const OAUTH_CLIENT_REGISTRATION_VERSION = 2 as const;
 
 const CREDENTIALS_KEY_PREFIX = 'dato-agent.oauth.credentials.v1';
 
@@ -11,6 +10,7 @@ export type CredentialScope = {
 
 export type OAuthClientCredentials = {
   clientId: string;
+  registrationVersion?: typeof OAUTH_CLIENT_REGISTRATION_VERSION;
   clientIdIssuedAt: number;
   redirectUri: string;
 };
@@ -170,29 +170,31 @@ export function createOAuthCredentials(
   });
 }
 
-/**
- * DCR registrations live for 30 days server-side. Treat them as stale one
- * hour early so a connection does not expire during an authorization flow.
- */
-export function isOAuthClientRegistrationFresh(
+/** Legacy registrations are replaced once on the next explicit sign-in. */
+export function isOAuthClientRegistrationReusable(
   client: OAuthClientCredentials,
-  now = Date.now(),
+  redirectUri: string,
 ): boolean {
-  if (!isFiniteNonNegativeNumber(client.clientIdIssuedAt)) {
-    return false;
-  }
-
-  const issuedAt = client.clientIdIssuedAt * 1000;
-  if (issuedAt > now + OAUTH_CLIENT_REGISTRATION_SAFETY_MARGIN_MS) {
-    return false;
-  }
-
   return (
-    now <
-    issuedAt +
-      OAUTH_CLIENT_REGISTRATION_TTL_MS -
-      OAUTH_CLIENT_REGISTRATION_SAFETY_MARGIN_MS
+    client.registrationVersion === OAUTH_CLIENT_REGISTRATION_VERSION &&
+    client.redirectUri === redirectUri
   );
+}
+
+/** A late failure must never erase a token saved by another plugin frame. */
+export function invalidateOAuthToken(
+  store: OAuthCredentialStore,
+  accessToken: string,
+): LoadedOAuthCredentials | null {
+  const loaded = store.load();
+  if (
+    !loaded?.credentials.token ||
+    loaded.credentials.token.accessToken !== accessToken
+  )
+    return loaded;
+  return store.save(createOAuthCredentials(loaded.credentials.client), {
+    remember: loaded.persistence === 'local',
+  });
 }
 
 function normalizeScopePart(value: string, name: string): string {
@@ -312,6 +314,9 @@ function normalizeClientCredentials(value: unknown): OAuthClientCredentials {
 
   return {
     clientId: value.clientId,
+    ...(value.registrationVersion === OAUTH_CLIENT_REGISTRATION_VERSION
+      ? { registrationVersion: OAUTH_CLIENT_REGISTRATION_VERSION }
+      : {}),
     clientIdIssuedAt: value.clientIdIssuedAt,
     redirectUri: value.redirectUri,
   };

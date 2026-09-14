@@ -4,9 +4,9 @@ import {
   type CredentialScope,
   createCredentialStore,
   createOAuthCredentials,
-  isOAuthClientRegistrationFresh,
-  OAUTH_CLIENT_REGISTRATION_SAFETY_MARGIN_MS,
-  OAUTH_CLIENT_REGISTRATION_TTL_MS,
+  invalidateOAuthToken,
+  isOAuthClientRegistrationReusable,
+  OAUTH_CLIENT_REGISTRATION_VERSION,
   OAUTH_CREDENTIALS_VERSION,
   type OAuthCredentials,
 } from './credentials';
@@ -123,29 +123,52 @@ describe('buildCredentialStorageKey', () => {
   });
 });
 
-describe('isOAuthClientRegistrationFresh', () => {
-  const issuedAtMs = credentials.client.clientIdIssuedAt * 1000;
-
-  it('accepts a registration before the safety window', () => {
+describe('client registration lifecycle', () => {
+  it('reuses marked registrations without an age limit', () => {
+    const client = {
+      ...credentials.client,
+      registrationVersion: OAUTH_CLIENT_REGISTRATION_VERSION,
+      clientIdIssuedAt: 1,
+    };
+    expect(isOAuthClientRegistrationReusable(client, client.redirectUri)).toBe(
+      true,
+    );
     expect(
-      isOAuthClientRegistrationFresh(
-        credentials.client,
-        issuedAtMs +
-          OAUTH_CLIENT_REGISTRATION_TTL_MS -
-          OAUTH_CLIENT_REGISTRATION_SAFETY_MARGIN_MS -
-          1,
-      ),
-    ).toBe(true);
-  });
-
-  it('treats a registration as stale at the safety window', () => {
+      isOAuthClientRegistrationReusable(client, 'https://new.example/callback'),
+    ).toBe(false);
     expect(
-      isOAuthClientRegistrationFresh(
+      isOAuthClientRegistrationReusable(
         credentials.client,
-        issuedAtMs +
-          OAUTH_CLIENT_REGISTRATION_TTL_MS -
-          OAUTH_CLIENT_REGISTRATION_SAFETY_MARGIN_MS,
+        credentials.client.redirectUri,
       ),
     ).toBe(false);
+  });
+
+  it('retains the marker and a valid legacy token across storage reads', () => {
+    const store = createCredentialStore(scope);
+    store.save(credentials);
+    expect(store.load()?.credentials.token).toEqual(credentials.token);
+    store.save(
+      createOAuthCredentials(
+        {
+          ...credentials.client,
+          registrationVersion: OAUTH_CLIENT_REGISTRATION_VERSION,
+        },
+        credentials.token,
+      ),
+    );
+    expect(store.load()?.credentials.client.registrationVersion).toBe(2);
+  });
+
+  it('invalidates only the matching token and preserves its registration', () => {
+    const store = createCredentialStore(scope);
+    store.save(credentials);
+    expect(
+      invalidateOAuthToken(store, 'different-token')?.credentials.token,
+    ).toEqual(credentials.token);
+    expect(
+      invalidateOAuthToken(store, credentials.token?.accessToken ?? '')
+        ?.credentials,
+    ).toEqual(createOAuthCredentials(credentials.client));
   });
 });

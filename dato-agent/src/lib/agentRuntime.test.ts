@@ -34,6 +34,7 @@ import {
   DATO_SCRIPT_OUTCOME_MARKER_PREFIX,
   type DatoScriptOutcomeV1,
 } from './datoScriptOutcome';
+import { DatoMcpAuthenticationError } from './mcpAuthentication';
 
 function response(
   id: string,
@@ -1052,7 +1053,7 @@ describe('AgentRuntime', () => {
     expect(request?.previous_response_id).toBe('resp-from-read-only-session');
     expect(request?.instructions).toContain('WRITABLE MODE');
     expect(request?.instructions).toContain(
-      'overrides any earlier user, assistant, or tool message that says Read Only is enabled or writing tools are unavailable',
+      "Plugin restrictions, OAuth access, and the account's project role all apply",
     );
     const mcpTool = request?.tools?.find((tool) => tool.type === 'mcp');
     expect(
@@ -4527,5 +4528,244 @@ describe('AgentRuntime', () => {
       ),
     ).toBe(false);
     expect([...latestActivityStatuses.values()]).not.toContain('in_progress');
+  });
+});
+
+describe('OpenAI MCP authentication and access', () => {
+  it.each([
+    'content_view_only',
+    'unknown',
+    'content_only',
+    'unrestricted',
+  ] as const)(
+    'applies OAuth %s to tool availability and the prompt',
+    async (level) => {
+      for (const readOnly of [false, true]) {
+        const client = new QueueResponsesClient([
+          eventsFor(response('access')),
+        ]);
+        const runtime = runtimeWith(client, {
+          readOnly,
+          mcpAccessLevel: level,
+          createDatoAsset: vi.fn(),
+        });
+        // biome-ignore lint/performance/noAwaitInLoops: Each permission case has its own runtime and isolated assertions.
+        await runtime.runTurn({ message: 'Read the project' });
+        const request = client.requests[0];
+        const writable =
+          !readOnly && (level === 'content_only' || level === 'unrestricted');
+        expect(
+          JSON.stringify(request.tools).includes(
+            'upsert_and_execute_unsafe_script',
+          ),
+        ).toBe(writable);
+        expect(
+          JSON.stringify(request.tools).includes('create_dato_asset'),
+        ).toBe(writable);
+        expect(request.instructions).toContain(
+          `"oauthAccessLevel": "${level}"`,
+        );
+        expect(JSON.stringify(request.tools)).toContain(
+          'upsert_and_execute_safe_script',
+        );
+      }
+    },
+  );
+
+  it('confirms an ambiguous provider MCP failure with whoami before requiring reconnection', async () => {
+    const verifyMcpConnection = vi
+      .fn()
+      .mockRejectedValue(new DatoMcpAuthenticationError());
+    const client: AgentResponsesClient = {
+      create: vi
+        .fn()
+        .mockRejectedValue(providerError(424, 'MCP dependency failed')),
+    };
+    const result = await runtimeWith(client, { verifyMcpConnection }).runTurn({
+      message: 'Read',
+    });
+    expect(verifyMcpConnection).toHaveBeenCalledOnce();
+    expect(result.error).toMatchObject({
+      code: 'mcp_auth_required',
+      retryable: false,
+    });
+  });
+
+  it.each([401, 403, 429, 500])(
+    'keeps provider HTTP %i separate from MCP authentication',
+    async (status) => {
+      const verifyMcpConnection = vi.fn();
+      const client: AgentResponsesClient = {
+        create: vi
+          .fn()
+          .mockRejectedValue(providerError(status, 'Provider failure')),
+      };
+      const result = await runtimeWith(client, { verifyMcpConnection }).runTurn(
+        { message: 'Read' },
+      );
+      expect(verifyMcpConnection).not.toHaveBeenCalled();
+      expect(result.error?.code).not.toBe('mcp_auth_required');
+    },
+  );
+
+  it('does not invalidate a verified connection for a wrapped permission denial', async () => {
+    const verifyMcpConnection = vi.fn().mockResolvedValue(undefined);
+    const client = new QueueResponsesClient([
+      mcpFailureEvents('INSUFFICIENT_PERMISSIONS'),
+    ]);
+    const result = await runtimeWith(client, { verifyMcpConnection }).runTurn({
+      message: 'Read',
+    });
+    expect(verifyMcpConnection).toHaveBeenCalled();
+    expect(result.error?.code).not.toBe('mcp_auth_required');
+  });
+
+  it('recognizes an MCP authentication failure inside streamed tool output', async () => {
+    const client = new QueueResponsesClient([
+      mcpFailureEvents('MCP request failed'),
+    ]);
+    const result = await runtimeWith(client, {
+      verifyMcpConnection: vi
+        .fn()
+        .mockRejectedValue(new DatoMcpAuthenticationError()),
+    }).runTurn({ message: 'Read' });
+    expect(result.error?.code).toBe('mcp_auth_required');
+  });
+
+  it('awaits access before the synchronous guard and never dispatches a rejected write', async () => {
+    const approval = scriptApproval('unsafe');
+    const client = new QueueResponsesClient([
+      eventsFor(response('approval', [approval])),
+    ]);
+    const runtime = runtimeWith(client);
+    await runtime.runTurn({ message: 'Update the record' });
+    const beforeDispatch = vi.fn();
+    const prepareDispatch = vi
+      .fn()
+      .mockRejectedValue(new DatoMcpAuthenticationError());
+    const result = await runtime.submitApprovals({
+      responseId: 'approval',
+      decisions: [{ approvalRequestId: approval.id, approve: true }],
+      unsafeDispatchCallbacks: { prepareDispatch, beforeDispatch },
+    });
+    expect(prepareDispatch).toHaveBeenCalledOnce();
+    expect(beforeDispatch).not.toHaveBeenCalled();
+    expect(client.requests).toHaveLength(1);
+    expect(result.error?.code).toBe('mcp_auth_required');
+  });
+
+  it('preserves an uncertain write and its authentication cause without replaying it', async () => {
+    const approval = scriptApproval('unsafe');
+    const first = new QueueResponsesClient([
+      eventsFor(response('approval', [approval])),
+    ]);
+    const create = vi
+      .fn()
+      .mockImplementationOnce(first.create.bind(first))
+      .mockRejectedValue(providerError(424, 'MCP request failed'));
+    const runtime = runtimeWith(
+      { create },
+      {
+        verifyMcpConnection: vi
+          .fn()
+          .mockRejectedValue(new DatoMcpAuthenticationError()),
+      },
+    );
+    await runtime.runTurn({ message: 'Update the record' });
+    const args = {
+      responseId: 'approval',
+      decisions: [{ approvalRequestId: approval.id, approve: true }],
+      unsafeDispatchCallbacks: { beforeDispatch: vi.fn() },
+    };
+    const result = await runtime.submitApprovals(args);
+    expect(result.error).toMatchObject({
+      code: 'unsafe_outcome_unknown',
+      mcpAuthRequired: true,
+      retryable: false,
+    });
+    await runtime.submitApprovals(args);
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the final guard and provider dispatch in the same synchronous boundary after access resolves', async () => {
+    const approval = scriptApproval('unsafe');
+    const client = new QueueResponsesClient([
+      eventsFor(response('approval', [approval])),
+      eventsFor(response('done', [completedApprovedScriptCall(approval)])),
+    ]);
+    const runtime = runtimeWith(client);
+    await runtime.runTurn({ message: 'Update' });
+    const dispatchOrder: string[] = [];
+    const original = client.create.bind(client);
+    client.create = async (...args) => {
+      dispatchOrder.push('network');
+      return original(...args);
+    };
+    await runtime.submitApprovals({
+      responseId: 'approval',
+      decisions: [{ approvalRequestId: approval.id, approve: true }],
+      unsafeDispatchCallbacks: {
+        prepareDispatch: async () => {
+          dispatchOrder.push('access');
+        },
+        beforeDispatch: () => {
+          dispatchOrder.push('guard');
+          queueMicrotask(() => dispatchOrder.push('microtask'));
+        },
+      },
+    });
+    expect(dispatchOrder.slice(0, 4)).toEqual([
+      'access',
+      'guard',
+      'network',
+      'microtask',
+    ]);
+  });
+
+  it('verifies authentication metadata forwarded inside an otherwise completed MCP call', async () => {
+    const client = new QueueResponsesClient([
+      eventsFor(
+        response('metadata', [
+          {
+            type: 'mcp_call',
+            id: 'identity',
+            name: 'whoami',
+            arguments: '{}',
+            server_label: 'datocms',
+            status: 'completed',
+            output: JSON.stringify({
+              _meta: {
+                'mcp/www_authenticate': ['Bearer error="invalid_token"'],
+              },
+            }),
+          },
+        ]),
+      ),
+    ]);
+    const verifyMcpConnection = vi
+      .fn()
+      .mockRejectedValue(new DatoMcpAuthenticationError());
+    const result = await runtimeWith(client, { verifyMcpConnection }).runTurn({
+      message: 'Read',
+    });
+    expect(verifyMcpConnection).toHaveBeenCalledOnce();
+    expect(result.error?.code).toBe('mcp_auth_required');
+  });
+
+  it('confirms a wrapped MCP failure raised midstream', async () => {
+    const client = new ThrowingResponsesClient([
+      {
+        events: [],
+        failure: providerError(424, 'Failed dependency', 'mcp_error'),
+      },
+    ]);
+    const verifyMcpConnection = vi
+      .fn()
+      .mockRejectedValue(new DatoMcpAuthenticationError());
+    const result = await runtimeWith(client, { verifyMcpConnection }).runTurn({
+      message: 'Read',
+    });
+    expect(verifyMcpConnection).toHaveBeenCalledOnce();
+    expect(result.error?.code).toBe('mcp_auth_required');
   });
 });

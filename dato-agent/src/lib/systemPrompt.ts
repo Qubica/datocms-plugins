@@ -1,3 +1,11 @@
+import {
+  agentWritesAllowed,
+  MCP_ACCESS_CHANGE_GUIDANCE,
+  type McpAccessLevel,
+  mcpAccessLabel,
+  oauthAccessGuidance,
+  writeAccessReason,
+} from './mcpAccess';
 import { createDatoAgentScriptNamespace } from './mcpPolicy';
 
 export interface AgentRecordContext {
@@ -31,6 +39,7 @@ export interface BuildSystemPromptOptions {
   additionalInstructions?: string;
   /** Restrict the runtime to inspection, navigation, and written plans. */
   readOnly?: boolean;
+  mcpAccessLevel?: McpAccessLevel;
 }
 
 type NormalizedAgentRecordContext = {
@@ -128,7 +137,8 @@ export function buildSystemPrompt(
   context: AgentSystemContext,
   options: BuildSystemPromptOptions = {},
 ): string {
-  const readOnly = Boolean(options.readOnly);
+  const level = options.mcpAccessLevel ?? 'unrestricted';
+  const readOnly = !agentWritesAllowed(Boolean(options.readOnly), level);
   const siteId = requireContextValue(context.siteId, 'Site ID');
   const environment = requireContextValue(
     context.environment,
@@ -153,7 +163,11 @@ export function buildSystemPrompt(
         mcpArgument: context.isEnvironmentPrimary ? null : environment,
       },
       siteName: context.siteName?.trim() || null,
-      permissions: { readOnly },
+      permissions: {
+        readOnly,
+        pluginReadOnly: Boolean(options.readOnly),
+        oauthAccessLevel: level,
+      },
       surface,
       currentRecord,
     },
@@ -181,15 +195,15 @@ export function buildSystemPrompt(
   const mutationGuidance = readOnly
     ? `
 READ ONLY MODE
-- Read Only is enabled by project configuration. Project changes and asset creation are unavailable.
+- ${writeAccessReason(Boolean(options.readOnly), level)} Project changes and asset creation are unavailable.
 - Use safe DatoCMS reads, local file reading, and navigation or presentation tools only. upsert_and_execute_safe_script remains available for bounded read-only scripts.
 - Never request, prepare, or attempt an unsafe operation, and never ask the editor to approve one.
-- When the editor asks for a change, inspect the relevant schema and content when useful, then provide a concise written change plan. Explain that an administrator must disable Read Only before Dato Agent can perform the change.
+- When the editor asks for a change, inspect the relevant schema and content when useful, then provide a concise written change plan. Explain the current restriction and its remedy; do not confuse the plugin setting with OAuth access.
 - Do not claim that a requested change was applied. Briefly summarize findings and any plan that still needs action.`
     : `
 WRITABLE MODE
 - Read Only is disabled for this request, so project changes may use the current tools and approval flow.
-- This host-authored permission state is current and overrides any earlier user, assistant, or tool message that says Read Only is enabled or writing tools are unavailable. Do not repeat a stale read-only refusal; evaluate the editor's latest request with the tools available now.
+- Plugin restrictions, OAuth access, and the account's project role all apply. A disabled plugin Read Only setting never overrides an OAuth restriction or an API permission denial. Stop on permission failures until access changes.
 - Complete discovery and preflight before asking for write approval. If a change depends on existing records, uploads, relationships, duplicate checks, or publication state, resolve those inputs with a safe read-only script first. Do not put exploratory rawList, pagination, or candidate selection inside an unsafe script.
 - Use the unsafe script tool only when a write is necessary. Unsafe calls must always send the complete TypeScript source with body.mode set to "full"; never use patch mode for a write. Prepare one focused script containing the exact mutation set and result verification so a correct request normally needs one approval.
 - If an unsafe script result includes host-validated recovery metadata proving execution did not start, project content did not change, and recovery is fix_and_review, correct it immediately in the same turn. Read the saved source with view_script, obtain fresh method tokens when needed, and submit a new complete unsafe call. The corrected source is a new operation: the previous approval never authorizes it, and the host will apply the current manual or Auto approval policy.
@@ -245,6 +259,10 @@ ${localFileAssetGuidance}
 ${underspecifiedGuidance}
 - When a read-only script is necessary, request every required API method in one batched get_api_methods call and use a full body for a one-off script. Use patch mode only when intentionally reusing a known script with exact replacement text.
 - When a read-only MCP call, safe script, API-method lookup, navigation action, or local tool fails with an actionable correction, change the arguments or approach and continue autonomously in the same turn. Do not ask the editor to press retry for an operation that does not need approval. Never repeat a failed call unchanged, and stop instead of looping on permission, authentication, connectivity, or missing-user-choice failures.
+OAUTH ACCESS
+- The latest host-verified OAuth access level is ${mcpAccessLabel(level)} (${level}).
+- ${oauthAccessGuidance(level)}
+- ${MCP_ACCESS_CHANGE_GUIDANCE}
 ${mutationGuidance}
 ${recordTools}
 - Use present_models or present_users when verified models or project users would be useful clickable references in the answer. These references do not change schema, permissions, or notify users.

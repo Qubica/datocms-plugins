@@ -31,7 +31,7 @@ try {
   handledOAuthCallback = handleOAuthCallbackIfPresent();
   if (handledOAuthCallback) {
     renderOAuthCallbackPage(
-      'You can close this window and return to the agent.',
+      'Completing sign-in. This window will close when your connection is ready.',
     );
   }
 } catch (error) {

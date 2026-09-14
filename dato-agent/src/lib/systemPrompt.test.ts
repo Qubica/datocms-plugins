@@ -232,7 +232,7 @@ describe('buildSystemPrompt', () => {
     );
     expect(prompt).toContain('provide a concise written change plan');
     expect(prompt).toContain(
-      'an administrator must disable Read Only before Dato Agent can perform the change',
+      'An administrator must disable it before Dato Agent can make changes',
     );
     expect(prompt).toContain(
       'You may read provider-supplied file contents and use that information',
@@ -256,10 +256,10 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('WRITABLE MODE');
     expect(prompt).toContain('Read Only is disabled for this request');
     expect(prompt).toContain(
-      'overrides any earlier user, assistant, or tool message that says Read Only is enabled or writing tools are unavailable',
+      "Plugin restrictions, OAuth access, and the account's project role all apply",
     );
     expect(prompt).toContain(
-      "evaluate the editor's latest request with the tools available now",
+      'Stop on permission failures until access changes',
     );
     expect(prompt).toContain('create_dato_asset');
     expect(prompt).toContain('Use the unsafe script tool');

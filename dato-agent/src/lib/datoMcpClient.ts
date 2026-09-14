@@ -10,6 +10,10 @@ import {
   extractDatoScriptOutcome,
   stripDatoScriptOutcomeMarker,
 } from './datoScriptOutcome';
+import {
+  DatoMcpAuthenticationError,
+  mcpAuthenticationChallenges,
+} from './mcpAuthentication';
 import { DATOCMS_MCP_URL, datoCmsMcpAllowedTools } from './mcpPolicy';
 
 export const MAX_DATOCMS_MCP_TOOL_PAGES = 20;
@@ -44,6 +48,8 @@ export interface DatoMcpToolResult {
   content: string;
   isError: boolean;
   structuredContent?: unknown;
+  authenticationRequired?: boolean;
+  authenticationChallenges?: string[];
   datoScriptOutcome?: DatoScriptOutcomeV1;
   /** Exact transport text retained only when display normalization changes it. */
   outcomeSourceText?: string;
@@ -238,7 +244,11 @@ export function serializeDatoMcpToolResult(
     stripDatoScriptOutcomeMarker(rawContent).trim() ||
     'DatoCMS returned no content.';
 
+  const challenges = mcpAuthenticationChallenges(candidate);
   return {
+    ...(challenges.length
+      ? { authenticationRequired: true, authenticationChallenges: challenges }
+      : {}),
     isError,
     content: boundedText(normalizedDisplayContent, maxCharacters),
     ...(rawContent !== normalizedDisplayContent
@@ -264,13 +274,14 @@ export function createDatoMcpCorsCompatibleFetch(
   baseFetch: FetchLike = globalThis.fetch.bind(globalThis),
 ): FetchLike {
   return async (url, init) => {
-    if (!init?.headers) {
-      return await baseFetch(url, init);
-    }
-
-    const headers = new Headers(init.headers);
-    headers.delete('mcp-protocol-version');
-    return await baseFetch(url, { ...init, headers });
+    const headers = init?.headers ? new Headers(init.headers) : undefined;
+    headers?.delete('mcp-protocol-version');
+    const response = await baseFetch(
+      url,
+      headers ? { ...init, headers } : init,
+    );
+    if (response.status === 401) throw new DatoMcpAuthenticationError();
+    return response;
   };
 }
 

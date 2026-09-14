@@ -2208,4 +2208,77 @@ describe('AgentSurface', () => {
       screen.getByRole('textbox', { name: 'Message the DatoCMS agent' }),
     ).toHaveFocus();
   });
+
+  it('offers reconnection after confirmed MCP authentication failure', async () => {
+    const onConnectDatoCms = vi.fn();
+    render(
+      <AgentSurface
+        connection={{
+          ...connected,
+          status: 'setup',
+          datoCmsStatus: 'mcp_auth_required',
+          datoCmsError: 'Reconnect your DatoCMS connection.',
+        }}
+        entries={[]}
+        onSubmit={vi.fn()}
+        onConnectDatoCms={onConnectDatoCms}
+      />,
+    );
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Reconnect DatoCMS' }),
+    );
+    expect(onConnectDatoCms).toHaveBeenCalledOnce();
+  });
+
+  it('keeps reads available with a visible access retry when access is unknown', async () => {
+    const onCheckDatoCmsAccess = vi.fn();
+    render(
+      <AgentSurface
+        connection={{ ...connected, oauthAccessLevel: 'unknown' }}
+        entries={[]}
+        onSubmit={vi.fn()}
+        onCheckDatoCmsAccess={onCheckDatoCmsAccess}
+      />,
+    );
+    expect(
+      screen.getByRole('textbox', { name: 'Message the DatoCMS agent' }),
+    ).not.toBeDisabled();
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Check access again' }),
+    );
+    expect(onCheckDatoCmsAccess).toHaveBeenCalledOnce();
+  });
+
+  it('shows OAuth access separately from plugin Read Only and explains how to change it', async () => {
+    render(
+      <AgentSurface
+        connection={{
+          ...connected,
+          oauthAccessLevel: 'content_only',
+          pluginReadOnly: true,
+        }}
+        entries={[]}
+        onSubmit={vi.fn()}
+      />,
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Open chats' }));
+    expect(screen.getByText('Read and edit content')).toBeVisible();
+    expect(
+      screen.getByText(
+        'Plugin Read Only is enabled. All agent writes are disabled.',
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByText(/Schema and management changes are unavailable/),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('link', { name: 'Account settings' }),
+    ).toHaveAttribute(
+      'href',
+      'https://dashboard.datocms.com/personal-account/account',
+    );
+    expect(
+      screen.getByText(/This affects all MCP clients of your account/),
+    ).toBeVisible();
+  });
 });

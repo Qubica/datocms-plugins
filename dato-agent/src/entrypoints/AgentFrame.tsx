@@ -71,7 +71,8 @@ import {
   type CredentialScope,
   createCredentialStore,
   createOAuthCredentials,
-  isOAuthClientRegistrationFresh,
+  invalidateOAuthToken,
+  isOAuthClientRegistrationReusable,
   type OAuthCredentials,
 } from '../lib/credentials';
 import {
@@ -84,6 +85,14 @@ import {
   getSessionLocalFile,
   hasSessionLocalFileBytes,
 } from '../lib/localFiles';
+import {
+  accessNarrowed,
+  agentWritesAllowed,
+  McpAccessSession,
+  type McpAccessSnapshot,
+  writeAccessReason,
+} from '../lib/mcpAccess';
+import { DatoMcpAuthenticationError } from '../lib/mcpAuthentication';
 import { DATOCMS_MCP_UNSAFE_SCRIPT_TOOL } from '../lib/mcpPolicy';
 import type { AgentMentionHost } from '../lib/mentionHost';
 import {
@@ -110,6 +119,7 @@ import {
   exchangeAuthorizationCode,
   navigateOAuthPopup,
   openOAuthPopup,
+  RemoteMcpOAuthError,
   registerClient,
   revokeToken,
   waitForOAuthCallback,
@@ -214,6 +224,8 @@ type ActiveTurn = {
   autoApprovalBundleCount: number;
   userStopped: boolean;
   unsafeOperationDispatched: boolean;
+  mcpAccessToken: string;
+  mcpPolicyGeneration: number;
   dispatchedApprovalIds: string[];
   cancelledBeforeDispatchApprovalIds: string[];
   cancelledBeforeDispatchReason?:
@@ -1907,7 +1919,8 @@ export default function AgentFrame(props: AgentFrameProps) {
     () => createAutoApprovalStore(autoApprovalScope),
     [autoApprovalScope],
   );
-  const readOnlyRef = useRef(props.config.readOnly);
+  const readOnlyRef = useRef(true);
+  const pluginReadOnlyRef = useRef(props.config.readOnly);
   const conversationStorageContext = useMemo(
     () => ({
       pluginId: props.pluginId,
@@ -1962,6 +1975,26 @@ export default function AgentFrame(props: AgentFrameProps) {
         return null;
       }
     });
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Permission checks belong to one credential store identity.
+  const accessSession = useMemo(() => new McpAccessSession(), [oauthStore]);
+  const [accessState, setAccessState] = useState<{
+    token: string;
+    snapshot: McpAccessSnapshot;
+  }>(() => ({ token: '', snapshot: accessSession.snapshot }));
+  const accessRef = useRef(accessState);
+  const [mcpAuthRequired, setMcpAuthRequired] = useState(false);
+  const accessPolicyGenerationRef = useRef(0);
+  const forceFreshRegistrationRef = useRef(false);
+  const oauthFlowGenerationRef = useRef(0);
+  const [accessChecking, setAccessChecking] = useState(false);
+  const accessLevel =
+    accessState.token === oauthCredentials?.token?.accessToken
+      ? accessState.snapshot.level
+      : 'unknown';
+  const effectiveReadOnly = !agentWritesAllowed(
+    props.config.readOnly,
+    accessLevel,
+  );
   const [oauthConnecting, setOauthConnecting] = useState(false);
   const [oauthError, setOauthError] = useState<string>();
   const [autoApproveEnabled, setAutoApproveEnabled] = useState(() => {
@@ -2026,7 +2059,9 @@ export default function AgentFrame(props: AgentFrameProps) {
   >(undefined);
 
   autoApproveEnabledRef.current = autoApproveEnabled;
-  readOnlyRef.current = props.config.readOnly;
+  readOnlyRef.current = effectiveReadOnly;
+  pluginReadOnlyRef.current = props.config.readOnly;
+  accessRef.current = accessState;
   liveRepairPolicyIdentityRef.current = repairPolicyIdentity;
   oauthCredentialsRef.current = oauthCredentials;
   editorDirtyRef.current = Boolean(
@@ -2037,6 +2072,7 @@ export default function AgentFrame(props: AgentFrameProps) {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      oauthFlowGenerationRef.current += 1;
       hostActionPendingRef.current = false;
       const activeTurn = activeTurnRef.current;
       if (activeTurn && !activeTurn.unsafeOperationDispatched) {
@@ -2397,6 +2433,8 @@ export default function AgentFrame(props: AgentFrameProps) {
     }
   };
 
+  useEffect(() => () => accessSession.close(), [accessSession]);
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: The serialized identity is the sole policy trigger; the ref-backed retire helper must not retrigger this effect on every render.
   useEffect(() => {
     if (repairPolicyIdentityRef.current === repairPolicyIdentity) return;
@@ -2416,7 +2454,10 @@ export default function AgentFrame(props: AgentFrameProps) {
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: This is a one-way policy transition keyed only by the persisted Read Only value and its session store. State helpers are synchronous ref-backed guards; adding the render-local dispatch function would retrigger this effect on every render.
   useEffect(() => {
-    if (!props.config.readOnly) {
+    if (
+      !effectiveReadOnly ||
+      (!props.config.readOnly && !accessState.snapshot.checked)
+    ) {
       return;
     }
 
@@ -2460,7 +2501,7 @@ export default function AgentFrame(props: AgentFrameProps) {
           decision: {
             approvalRequestId: pending.request.approvalRequestId,
             approve: false,
-            reason: READ_ONLY_REJECTION_MESSAGE,
+            reason: accessRestrictionReason(),
           },
         });
       }
@@ -2476,7 +2517,12 @@ export default function AgentFrame(props: AgentFrameProps) {
     for (const responseId of responseIds) {
       void dispatchApprovalGroup(responseId);
     }
-  }, [autoApprovalStore, props.config.readOnly]);
+  }, [
+    autoApprovalStore,
+    props.config.readOnly,
+    effectiveReadOnly,
+    accessState.snapshot.checked,
+  ]);
 
   const beginHostAction = (): boolean => {
     if (!mountedRef.current || hostActionPendingRef.current) {
@@ -2687,6 +2733,247 @@ export default function AgentFrame(props: AgentFrameProps) {
   };
   checkpointActiveTurnRef.current = checkpointInterruptedTurn;
 
+  function disableAutoApprovalForAccess(): void {
+    autoApproveEnabledRef.current = false;
+    setAutoApproveEnabled(false);
+    try {
+      autoApprovalStore.setEnabled(false);
+    } catch {
+      /* Live policy still blocks writes. */
+    }
+  }
+
+  function accessRestrictionReason(): string {
+    return pluginReadOnlyRef.current
+      ? READ_ONLY_REJECTION_MESSAGE
+      : writeAccessReason(false, accessRef.current.snapshot.level);
+  }
+
+  function requireMcpReconnect(token: string): void {
+    if (!token || oauthCredentialsRef.current?.token?.accessToken !== token)
+      return;
+    let next = createOAuthCredentials(oauthCredentialsRef.current.client);
+    try {
+      const loaded = invalidateOAuthToken(oauthStore, token);
+      if (
+        loaded?.credentials.token &&
+        loaded.credentials.token.accessToken !== token
+      ) {
+        replaceOAuthCredentials(loaded.credentials);
+        return;
+      }
+      next = loaded?.credentials ?? next;
+    } catch {
+      /* Forget the failed token in memory even if storage is unavailable. */
+    }
+    oauthCredentialsRef.current = next;
+    setOauthCredentials(next);
+    accessPolicyGenerationRef.current += 1;
+    setMcpAuthRequired(true);
+    setOauthError(new DatoMcpAuthenticationError().message);
+    accessSession.setToken('');
+    accessRef.current = { token: '', snapshot: accessSession.snapshot };
+    setAccessState(accessRef.current);
+    readOnlyRef.current = true;
+    disableAutoApprovalForAccess();
+    retireUnsafeRepairCandidate();
+    retryCandidateRef.current = undefined;
+    clearMcpContinuationState();
+    const turn = activeTurnRef.current;
+    if (!turn?.unsafeOperationDispatched) {
+      if (turn) checkpointActiveTurnRef.current?.(turn, true);
+      pendingApprovalsRef.current = new Map();
+      setPendingApprovals(new Map());
+      pendingNavigationRef.current = [];
+      activeTurnRef.current = undefined;
+      abortRef.current?.abort();
+      void runtimeRef.current?.dispose?.();
+      runtimeRef.current = undefined;
+      setRunning(false);
+    }
+  }
+
+  function invalidatePendingWritesAfterNarrowing(): void {
+    // Never carry an approval prepared with broader access into a new policy.
+    const blockedIds = new Set(
+      [...pendingApprovalsRef.current.values()]
+        .filter(
+          (pending) =>
+            pending.request.name === DATOCMS_MCP_UNSAFE_SCRIPT_TOOL &&
+            !activeTurnRef.current?.dispatchedApprovalIds.includes(
+              pending.request.approvalRequestId,
+            ),
+        )
+        .map((pending) => pending.request.approvalRequestId),
+    );
+    if (approvalDispatchRef.current.size === 0 && blockedIds.size > 0) {
+      updateEntries((current) =>
+        current.map((entry) =>
+          entry.kind === 'approval' && blockedIds.has(entry.approval.id)
+            ? {
+                ...entry,
+                approval: {
+                  ...entry.approval,
+                  status: 'rejected' as const,
+                  error:
+                    'DatoCMS access changed. Start a new request with the current access level.',
+                },
+              }
+            : entry,
+        ),
+      );
+      updatePendingApprovals(
+        (current) =>
+          new Map([...current].filter(([id]) => !blockedIds.has(id))),
+      );
+      const turn = activeTurnRef.current;
+      if (turn && !turn.unsafeOperationDispatched) {
+        checkpointActiveTurnRef.current?.(turn, true);
+        activeTurnRef.current = undefined;
+        abortRef.current?.abort();
+        void runtimeRef.current?.dispose?.();
+        runtimeRef.current = undefined;
+        setRunning(false);
+      }
+    }
+  }
+
+  async function refreshMcpAccess(
+    signal?: AbortSignal,
+  ): Promise<McpAccessSnapshot> {
+    const token = oauthCredentialsRef.current?.token?.accessToken ?? '';
+    try {
+      const snapshot = await accessSession.check(token, signal);
+      if (
+        !mountedRef.current ||
+        oauthCredentialsRef.current?.token?.accessToken !== token
+      ) {
+        throw new DOMException('The DatoCMS connection changed.', 'AbortError');
+      }
+      const previous = accessRef.current;
+      accessRef.current = { token, snapshot };
+      setAccessState(accessRef.current);
+      readOnlyRef.current = !agentWritesAllowed(
+        pluginReadOnlyRef.current,
+        snapshot.level,
+      );
+      if (readOnlyRef.current) disableAutoApprovalForAccess();
+      if (
+        previous.token === token &&
+        accessNarrowed(previous.snapshot.level, snapshot.level)
+      ) {
+        retireUnsafeRepairCandidate();
+        clearOpenAiResponseChain();
+        accessPolicyGenerationRef.current += 1;
+        invalidatePendingWritesAfterNarrowing();
+      }
+      return snapshot;
+    } catch (error) {
+      if (error instanceof DatoMcpAuthenticationError)
+        requireMcpReconnect(token);
+      throw error;
+    }
+  }
+
+  async function prepareWriteAccess(signal?: AbortSignal): Promise<void> {
+    const token = oauthCredentialsRef.current?.token?.accessToken;
+    const turn = activeTurnRef.current;
+    const levelBefore = accessRef.current.snapshot.level;
+    const snapshot = await refreshMcpAccess(signal);
+    if (
+      !token ||
+      !turn ||
+      turn.mcpAccessToken !== token ||
+      oauthCredentialsRef.current?.token?.accessToken !== token ||
+      activeTurnRef.current !== turn ||
+      signal?.aborted
+    ) {
+      throw new DOMException(
+        'The DatoCMS operation was cancelled.',
+        'AbortError',
+      );
+    }
+    if (readOnlyRef.current) throw new Error(accessRestrictionReason());
+    if (
+      turn.mcpPolicyGeneration !== accessPolicyGenerationRef.current ||
+      accessNarrowed(levelBefore, snapshot.level)
+    )
+      throw new Error(
+        'DatoCMS access changed. Start a new request before making changes.',
+      );
+  }
+
+  const refreshMcpAccessRef = useRef(refreshMcpAccess);
+  refreshMcpAccessRef.current = refreshMcpAccess;
+  useEffect(() => {
+    const token = oauthCredentials?.token?.accessToken ?? '';
+    accessSession.setToken(token);
+    accessRef.current = { token, snapshot: accessSession.snapshot };
+    setAccessState(accessRef.current);
+    if (!token) {
+      setAccessChecking(false);
+      return;
+    }
+    const controller = new AbortController();
+    setAccessChecking(true);
+    void refreshMcpAccessRef
+      .current(controller.signal)
+      .catch(() => undefined)
+      .finally(() => {
+        if (!controller.signal.aborted) setAccessChecking(false);
+      });
+    return () => controller.abort();
+  }, [accessSession, oauthCredentials?.token?.accessToken]);
+
+  function replaceOAuthCredentials(
+    nextCredentials: OAuthCredentials | null,
+  ): void {
+    oauthFlowGenerationRef.current += 1;
+    if (oauthPopupRef.current && !oauthPopupRef.current.closed)
+      oauthPopupRef.current.close();
+    oauthPopupRef.current = undefined;
+    setOauthConnecting(false);
+    retireUnsafeRepairCandidate();
+
+    const activeTurn = activeTurnRef.current;
+    if (activeTurn && !activeTurn.unsafeOperationDispatched) {
+      checkpointActiveTurnRef.current?.(activeTurn, true);
+      activeTurnRef.current = undefined;
+      retryCandidateRef.current = undefined;
+      pendingNavigationRef.current = [];
+      pendingApprovalsRef.current = new Map();
+      setPendingApprovals(new Map());
+      approvalDispatchRef.current.clear();
+      autoApprovalDispatchRef.current.clear();
+      const runtime = runtimeRef.current;
+      runtimeRef.current = undefined;
+      abortRef.current?.abort();
+      abortRef.current = undefined;
+      void runtime?.dispose?.();
+      setRunning(false);
+    }
+
+    clearMcpContinuationState();
+    disableAutoApprovalForAccess();
+    accessSession.close();
+    accessSession.setToken(nextCredentials?.token?.accessToken ?? '');
+    readOnlyRef.current = true;
+    accessPolicyGenerationRef.current += 1;
+    const lostAuthentication = Boolean(
+      oauthCredentialsRef.current?.token &&
+        nextCredentials &&
+        !nextCredentials.token &&
+        nextCredentials.client.clientId ===
+          oauthCredentialsRef.current.client.clientId,
+    );
+    setMcpAuthRequired(lostAuthentication);
+    oauthCredentialsRef.current = nextCredentials;
+    setOauthCredentials(nextCredentials);
+    setOauthError(
+      lostAuthentication ? new DatoMcpAuthenticationError().message : undefined,
+    );
+  }
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: OAuth storage identity is the sole external trigger; recovery invalidation uses the current ref-backed helper.
   useEffect(() => {
     const credentialIdentity = (credentials: OAuthCredentials | null) =>
@@ -2716,29 +3003,7 @@ export default function AgentFrame(props: AgentFrameProps) {
         return;
       }
 
-      retireUnsafeRepairCandidate();
-
-      const activeTurn = activeTurnRef.current;
-      if (activeTurn && !activeTurn.unsafeOperationDispatched) {
-        checkpointActiveTurnRef.current?.(activeTurn, true);
-        activeTurnRef.current = undefined;
-        retryCandidateRef.current = undefined;
-        pendingNavigationRef.current = [];
-        pendingApprovalsRef.current = new Map();
-        setPendingApprovals(new Map());
-        approvalDispatchRef.current.clear();
-        autoApprovalDispatchRef.current.clear();
-        const runtime = runtimeRef.current;
-        runtimeRef.current = undefined;
-        abortRef.current?.abort();
-        abortRef.current = undefined;
-        void runtime?.dispose?.();
-        setRunning(false);
-      }
-
-      oauthCredentialsRef.current = nextCredentials;
-      setOauthCredentials(nextCredentials);
-      setOauthError(undefined);
+      replaceOAuthCredentials(nextCredentials);
     };
 
     window.addEventListener('storage', synchronizeOAuthCredentials);
@@ -2761,6 +3026,22 @@ export default function AgentFrame(props: AgentFrameProps) {
       // temporarily unavailable.
     }
   };
+
+  function clearMcpContinuationState(): void {
+    try {
+      for (const stored of conversationStore.list()) {
+        if (
+          stored.previousResponseId ||
+          stored.responseProvider ||
+          stored.responseModel
+        )
+          conversationStore.save(withoutProviderState(stored));
+      }
+    } catch {
+      /* The current conversation must still forget its provider state. */
+    }
+    clearOpenAiResponseChain();
+  }
 
   const runtimeSystemContext = () => ({
     siteId: props.siteId,
@@ -2997,6 +3278,7 @@ export default function AgentFrame(props: AgentFrameProps) {
           systemPrompt: buildSystemPrompt(systemContext, {
             additionalInstructions: props.config.additionalInstructions,
             readOnly: props.config.readOnly,
+            mcpAccessLevel: accessRef.current.snapshot.level,
           }),
         },
         transcript: entriesRef.current,
@@ -3173,11 +3455,11 @@ export default function AgentFrame(props: AgentFrameProps) {
 
   const hostCreateAsset = mentionHost.createAsset;
   const createDatoAsset: CreateDatoAssetCallback | undefined =
-    !props.config.readOnly && hostCreateAsset && mentionHost.canCreateAssets
+    hostCreateAsset && mentionHost.canCreateAssets
       ? // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Source validation, irreversible dispatch marking, and outcome-unknown handling form one asset-upload boundary.
         async (input, signal) => {
           if (readOnlyRef.current) {
-            throw new Error(READ_ONLY_REJECTION_MESSAGE);
+            throw new Error(accessRestrictionReason());
           }
           const turn = activeTurnRef.current;
           if (!turn) {
@@ -3218,21 +3500,34 @@ export default function AgentFrame(props: AgentFrameProps) {
                   url: input.url,
                   ...(input.filename ? { filename: input.filename } : {}),
                 };
+          await prepareWriteAccess(signal);
+          const automaticUpload =
+            autoApproveEnabledRef.current && !editorDirtyRef.current;
           let dispatched = false;
           let mention: Awaited<ReturnType<typeof hostCreateAsset>>;
           try {
             if (readOnlyRef.current) {
-              throw new Error(READ_ONLY_REJECTION_MESSAGE);
+              throw new Error(accessRestrictionReason());
             }
             mention = await hostCreateAsset(source, {
-              skipConfirmation:
-                autoApproveEnabledRef.current && !editorDirtyRef.current,
+              skipConfirmation: automaticUpload,
               signal,
+              prepareUploadDispatch: () => prepareWriteAccess(signal),
               onUploadDispatch: () => {
                 if (readOnlyRef.current) {
-                  throw new Error(READ_ONLY_REJECTION_MESSAGE);
+                  throw new Error(accessRestrictionReason());
                 }
-                if (activeTurnRef.current !== turn) {
+                if (
+                  !mentionHostRef.current.canCreateAssets ||
+                  (automaticUpload &&
+                    (!autoApproveEnabledRef.current ||
+                      editorDirtyRef.current)) ||
+                  signal?.aborted ||
+                  activeTurnRef.current !== turn ||
+                  turn.mcpAccessToken !==
+                    oauthCredentialsRef.current?.token?.accessToken ||
+                  turn.mcpPolicyGeneration !== accessPolicyGenerationRef.current
+                ) {
                   throw new Error(
                     'The active chat request is no longer available.',
                   );
@@ -3271,7 +3566,11 @@ export default function AgentFrame(props: AgentFrameProps) {
     createAgentRuntime({
       provider: props.config.provider,
       apiKey: activeApiKey(props.config),
-      mcpAccessToken: oauthCredentials?.token?.accessToken ?? '',
+      mcpAccessToken: oauthCredentialsRef.current?.token?.accessToken ?? '',
+      mcpAccessLevel: accessRef.current.snapshot.level,
+      verifyMcpConnection: async (signal) => {
+        await refreshMcpAccess(signal);
+      },
       model: activeModel(props.config),
       modelMaxOutputTokens: activeModelMaxOutputTokens(props.config),
       reasoningEffort: activeReasoningEffort(props.config),
@@ -3280,7 +3579,7 @@ export default function AgentFrame(props: AgentFrameProps) {
       additionalInstructions: props.config.additionalInstructions,
       hostContext,
       getModelSchema: props.getModelSchema,
-      ...(createDatoAsset ? { createDatoAsset } : {}),
+      ...(!readOnlyRef.current && createDatoAsset ? { createDatoAsset } : {}),
       context: runtimeSystemContext(),
       navigation: {
         presentRecords: async ({ title, records }) => {
@@ -3439,7 +3738,7 @@ export default function AgentFrame(props: AgentFrameProps) {
       activeTurnRef.current?.repairPolicy,
     );
     const blockedReason = blockedByReadOnly
-      ? READ_ONLY_REJECTION_MESSAGE
+      ? accessRestrictionReason()
       : repairViolation;
     const pending: PendingApproval = {
       responseId,
@@ -3543,6 +3842,12 @@ export default function AgentFrame(props: AgentFrameProps) {
         break;
       case 'error':
         if (
+          event.error.code === 'mcp_auth_required' ||
+          event.error.mcpAuthRequired
+        ) {
+          requireMcpReconnect(turn.mcpAccessToken);
+        }
+        if (
           event.error.code === 'aborted' ||
           (turn.userStopped && !turn.unsafeOperationDispatched)
         ) {
@@ -3623,7 +3928,11 @@ export default function AgentFrame(props: AgentFrameProps) {
           const finishedRuntime = runtimeRef.current;
           runtimeRef.current = undefined;
           void finishedRuntime?.dispose?.();
-          const completed = settledTurnStatus === 'completed';
+          const completed =
+            settledTurnStatus === 'completed' &&
+            turn.mcpAccessToken ===
+              oauthCredentialsRef.current?.token?.accessToken &&
+            turn.mcpPolicyGeneration === accessPolicyGenerationRef.current;
           const openAiTurn = turn.provider === 'openai';
           persistConversation({
             previousResponseId:
@@ -3735,6 +4044,8 @@ export default function AgentFrame(props: AgentFrameProps) {
       autoApprovalBundleCount: 0,
       userStopped: false,
       unsafeOperationDispatched: false,
+      mcpAccessToken: oauthCredentialsRef.current?.token?.accessToken ?? '',
+      mcpPolicyGeneration: accessPolicyGenerationRef.current,
       dispatchedApprovalIds: [],
       cancelledBeforeDispatchApprovalIds: [],
       localAssetDispatchState: 'idle',
@@ -3841,6 +4152,21 @@ export default function AgentFrame(props: AgentFrameProps) {
     };
 
     try {
+      await refreshMcpAccess(controller.signal);
+      if (
+        controller.signal.aborted ||
+        activeTurnRef.current !== turn ||
+        oauthCredentialsRef.current?.token?.accessToken !== turn.mcpAccessToken
+      )
+        return;
+      if (
+        repairContext &&
+        turn.mcpPolicyGeneration !== accessPolicyGenerationRef.current
+      )
+        throw new Error(
+          'DatoCMS access changed. Start a new request before preparing a fix.',
+        );
+      turn.mcpPolicyGeneration = accessPolicyGenerationRef.current;
       const hostContext = props.loadHostContext
         ? await loadFreshHostContext()
         : undefined;
@@ -4233,7 +4559,7 @@ export default function AgentFrame(props: AgentFrameProps) {
       turn,
       unsafeJournalId,
       approvalRequestIds,
-      READ_ONLY_REJECTION_MESSAGE,
+      accessRestrictionReason(),
     );
   }
 
@@ -4265,7 +4591,7 @@ export default function AgentFrame(props: AgentFrameProps) {
           decision: {
             approvalRequestId: item.request.approvalRequestId,
             approve: false,
-            reason: READ_ONLY_REJECTION_MESSAGE,
+            reason: accessRestrictionReason(),
           },
         };
       });
@@ -4418,6 +4744,18 @@ export default function AgentFrame(props: AgentFrameProps) {
           ...(unsafeJournalId
             ? {
                 unsafeDispatchCallbacks: {
+                  prepareDispatch: async (ids, signal) => {
+                    try {
+                      await prepareWriteAccess(signal);
+                    } catch (error) {
+                      cancelUnsafeDispatchBeforeNetwork(
+                        turn,
+                        unsafeJournalId,
+                        ids,
+                      );
+                      throw error;
+                    }
+                  },
                   beforeDispatch: (
                     dispatchedApprovalIds: readonly string[],
                   ) => {
@@ -4465,6 +4803,10 @@ export default function AgentFrame(props: AgentFrameProps) {
                     );
                     if (
                       activeTurnRef.current !== turn ||
+                      turn.mcpAccessToken !==
+                        oauthCredentialsRef.current?.token?.accessToken ||
+                      turn.mcpPolicyGeneration !==
+                        accessPolicyGenerationRef.current ||
                       controller.signal.aborted ||
                       hostActionPendingRef.current ||
                       editorDirtyRef.current ||
@@ -5084,57 +5426,122 @@ export default function AgentFrame(props: AgentFrameProps) {
   }
 
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: The popup, DCR, PKCE, persistence, and cleanup steps are kept together to guarantee one authorization lifecycle.
-  const connectDatoCms = async () => {
+  const connectDatoCms = async (forceNew = false) => {
+    if (oauthConnecting || running) return;
+    const flowGeneration = ++oauthFlowGenerationRef.current;
     setOauthConnecting(true);
     setOauthError(undefined);
     let popup: Window | undefined;
     let pendingState: string | undefined;
-
     try {
       popup = openOAuthPopup();
       oauthPopupRef.current = popup;
       const redirectUri = computeRedirectUri();
-      const existingClient = oauthCredentials?.client;
-      const client =
-        existingClient &&
-        existingClient.redirectUri === redirectUri &&
-        isOAuthClientRegistrationFresh(existingClient)
-          ? existingClient
-          : await registerClient(redirectUri);
-      oauthStore.save(createOAuthCredentials(client), {
-        remember: true,
-      });
-      const authorization = await createAuthorizationRequest({
-        scope: credentialScope,
-        clientId: client.clientId,
-        redirectUri: client.redirectUri,
-      });
-      pendingState = authorization.state;
-      navigateOAuthPopup(popup, authorization.authorizationUrl);
-      const callback = await waitForOAuthCallback(popup, authorization.state);
-      const token = await exchangeAuthorizationCode({
-        scope: credentialScope,
-        code: callback.code,
-        state: callback.state,
-      });
-      const credentials = createOAuthCredentials(client, token);
-      oauthStore.save(credentials, { remember: true });
-      setOauthCredentials(credentials);
+      let existingClient =
+        forceNew || forceFreshRegistrationRef.current
+          ? undefined
+          : oauthCredentialsRef.current?.client;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          let client = existingClient;
+          if (
+            !client ||
+            !isOAuthClientRegistrationReusable(client, redirectUri)
+          ) {
+            // biome-ignore lint/performance/noAwaitInLoops: Retry registration only after the previous invalid_client failure.
+            client = await registerClient(redirectUri);
+          }
+          if (
+            !mountedRef.current ||
+            oauthFlowGenerationRef.current !== flowGeneration
+          )
+            return;
+          const registered = createOAuthCredentials(client);
+          oauthStore.save(registered, { remember: true });
+          oauthCredentialsRef.current = registered;
+          setOauthCredentials(registered);
+          existingClient = client;
+          const authorization = await createAuthorizationRequest({
+            scope: credentialScope,
+            clientId: client.clientId,
+            redirectUri: client.redirectUri,
+          });
+          pendingState = authorization.state;
+          navigateOAuthPopup(popup, authorization.authorizationUrl);
+          const callback = await waitForOAuthCallback(
+            popup,
+            authorization.state,
+            { closeOnSuccess: false },
+          );
+          const token = await exchangeAuthorizationCode({
+            scope: credentialScope,
+            code: callback.code,
+            state: callback.state,
+          });
+          if (
+            !mountedRef.current ||
+            oauthFlowGenerationRef.current !== flowGeneration
+          )
+            return;
+          const credentials = createOAuthCredentials(client, token);
+          oauthStore.save(credentials, { remember: true });
+          oauthCredentialsRef.current = credentials;
+          setOauthCredentials(credentials);
+          accessSession.close();
+          disableAutoApprovalForAccess();
+          accessPolicyGenerationRef.current += 1;
+          setMcpAuthRequired(false);
+          forceFreshRegistrationRef.current = false;
+          clearMcpContinuationState();
+          pendingApprovalsRef.current = new Map();
+          setPendingApprovals(new Map());
+          retryCandidateRef.current = undefined;
+          retireUnsafeRepairCandidate();
+          void runtimeRef.current?.dispose?.();
+          runtimeRef.current = undefined;
+          await refreshMcpAccess();
+          if (!popup.closed) popup.close();
+          return;
+        } catch (error) {
+          if (pendingState)
+            discardPendingAuthorization(credentialScope, pendingState);
+          pendingState = undefined;
+          if (
+            error instanceof RemoteMcpOAuthError &&
+            error.code === 'invalid_client' &&
+            oauthFlowGenerationRef.current === flowGeneration
+          ) {
+            oauthStore.clear();
+            oauthCredentialsRef.current = null;
+            setOauthCredentials(null);
+            existingClient = undefined;
+            forceFreshRegistrationRef.current = true;
+            if (attempt === 0 && !popup.closed) continue;
+          }
+          throw error;
+        }
+      }
     } catch (error) {
-      if (pendingState) {
+      if (pendingState)
         discardPendingAuthorization(credentialScope, pendingState);
+      if (popup && !popup.closed) popup.close();
+      if (
+        mountedRef.current &&
+        oauthFlowGenerationRef.current === flowGeneration
+      ) {
+        setOauthError(
+          error instanceof RemoteMcpOAuthError && error.code === 'invalid_grant'
+            ? 'This sign-in code is no longer valid. Start sign-in again to get a new code.'
+            : error instanceof Error
+              ? error.message
+              : 'Could not connect to DatoCMS.',
+        );
       }
-      if (popup && !popup.closed) {
-        popup.close();
-      }
-      setOauthError(
-        error instanceof Error
-          ? error.message
-          : 'Could not connect to DatoCMS.',
-      );
     } finally {
-      oauthPopupRef.current = undefined;
-      setOauthConnecting(false);
+      if (oauthFlowGenerationRef.current === flowGeneration) {
+        oauthPopupRef.current = undefined;
+        setOauthConnecting(false);
+      }
     }
   };
 
@@ -5184,7 +5591,11 @@ export default function AgentFrame(props: AgentFrameProps) {
       } catch {
         // Clear the in-memory credential even when browser storage is blocked.
       }
+      oauthCredentialsRef.current = null;
       setOauthCredentials(null);
+      accessPolicyGenerationRef.current += 1;
+      setMcpAuthRequired(false);
+      accessSession.setToken('');
       void runtimeRef.current?.dispose?.();
       runtimeRef.current = undefined;
       setOauthConnecting(false);
@@ -5647,11 +6058,16 @@ export default function AgentFrame(props: AgentFrameProps) {
         providerLabel: providerLabel(props.config.provider),
         datoCmsStatus: oauthConnecting
           ? 'connecting'
-          : hasDatoCmsConnection
-            ? 'connected'
-            : oauthError
-              ? 'error'
-              : 'disconnected',
+          : mcpAuthRequired
+            ? 'mcp_auth_required'
+            : hasDatoCmsConnection
+              ? 'connected'
+              : oauthError
+                ? 'error'
+                : 'disconnected',
+        oauthAccessLevel: accessLevel,
+        pluginReadOnly: props.config.readOnly,
+        accessChecking,
         datoCmsAccountLabel: hasDatoCmsConnection ? 'DatoCMS' : undefined,
         datoCmsError: oauthError,
       }}
@@ -5662,8 +6078,10 @@ export default function AgentFrame(props: AgentFrameProps) {
       autoApproveChanging={autoApproveChanging}
       autoApproveError={autoApproveError}
       autoApproveDisabledReason={
-        props.config.readOnly
-          ? 'Auto-approve is unavailable in Read Only mode.'
+        effectiveReadOnly
+          ? props.config.readOnly
+            ? 'Auto-approve is unavailable in Read Only mode.'
+            : accessRestrictionReason()
           : undefined
       }
       persistenceWarning={conversationPersistenceError}
@@ -5687,6 +6105,13 @@ export default function AgentFrame(props: AgentFrameProps) {
       onCopyFailureDiagnostics={copyFailureDiagnostics}
       onConnectDatoCms={() => void connectDatoCms()}
       onDisconnectDatoCms={() => void disconnectDatoCms()}
+      onCheckDatoCmsAccess={() => {
+        setAccessChecking(true);
+        void refreshMcpAccess()
+          .catch(() => undefined)
+          .finally(() => setAccessChecking(false));
+      }}
+      onRestartDatoCmsConnection={() => void connectDatoCms(true)}
       recentConversations={storedConversations.map((stored) => ({
         id: stored.id,
         title: stored.title,
@@ -5706,9 +6131,7 @@ export default function AgentFrame(props: AgentFrameProps) {
       onApproveUnsafeAction={(approval) => void decideApproval(approval, true)}
       onRejectUnsafeAction={(approval) => void decideApproval(approval, false)}
       onRepairUnsafeAction={(approval) => void repairUnsafeApproval(approval)}
-      onAutoApproveChange={
-        props.config.readOnly ? undefined : changeAutoApprove
-      }
+      onAutoApproveChange={effectiveReadOnly ? undefined : changeAutoApprove}
     />
   );
 }

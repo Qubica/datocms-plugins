@@ -458,7 +458,12 @@ describe('createAgentMentionHost', () => {
           fileOrBlob: file,
           filename: file.name,
         },
-        { onUploadDispatch: () => dispatchOrder.push('dispatch') },
+        {
+          prepareUploadDispatch: async () => {
+            dispatchOrder.push('access');
+          },
+          onUploadDispatch: () => dispatchOrder.push('dispatch'),
+        },
       ),
     ).resolves.toMatchObject({
       type: 'asset',
@@ -482,7 +487,7 @@ describe('createAgentMentionHost', () => {
       fileOrBlob: file,
       filename: 'brief.pdf',
     });
-    expect(dispatchOrder).toEqual(['dispatch', 'upload']);
+    expect(dispatchOrder).toEqual(['access', 'dispatch', 'upload']);
   });
 
   it('does not create an asset when the editor cancels confirmation', async () => {
@@ -567,6 +572,59 @@ describe('createAgentMentionHost', () => {
     resolveConfirmation('create');
 
     await expect(creation).rejects.toMatchObject({ name: 'AbortError' });
+    expect(cmaMocks.createUpload).not.toHaveBeenCalled();
+  });
+  it('does not upload when the access check rejects after confirmation', async () => {
+    let resolveConfirmation: (choice: string) => void = () => undefined;
+    const openConfirm = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveConfirmation = resolve;
+        }),
+    );
+    const host = createAgentMentionHost(
+      createContext({
+        currentUserAccessToken: 'user-token',
+        cmaBaseUrl: 'https://site-api.datocms.com',
+        openConfirm,
+        currentRole: {
+          attributes: {
+            positive_upload_permissions: [],
+            negative_upload_permissions: [],
+            positive_item_type_permissions: [],
+            negative_item_type_permissions: [],
+          },
+          meta: {
+            final_permissions: {
+              can_edit_schema: false,
+              positive_upload_permissions: [
+                { environment: 'main', action: 'create' },
+              ],
+              negative_upload_permissions: [],
+            },
+          },
+        },
+      }),
+    );
+    const prepareUploadDispatch = vi
+      .fn()
+      .mockRejectedValue(new Error('OAuth access changed'));
+    const onUploadDispatch = vi.fn();
+    const creation = host.createAsset?.(
+      {
+        source: 'file',
+        fileOrBlob: new File(['content'], 'notes.txt'),
+        filename: 'notes.txt',
+      },
+      { prepareUploadDispatch, onUploadDispatch },
+    );
+
+    await vi.waitFor(() => expect(openConfirm).toHaveBeenCalledOnce());
+    resolveConfirmation('create');
+
+    await expect(creation).rejects.toThrow('OAuth access changed');
+    expect(prepareUploadDispatch).toHaveBeenCalledOnce();
+    expect(onUploadDispatch).not.toHaveBeenCalled();
     expect(cmaMocks.createUpload).not.toHaveBeenCalled();
   });
 

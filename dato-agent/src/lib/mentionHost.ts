@@ -88,6 +88,7 @@ export type AgentAssetCreationOptions = {
   skipConfirmation?: boolean;
   signal?: AbortSignal;
   /** Runs immediately before the first irreversible upload request is made. */
+  prepareUploadDispatch?: () => Promise<void>;
   onUploadDispatch?: () => void;
 };
 
@@ -685,6 +686,9 @@ async function createAssetWithClient({
   options.signal?.throwIfAborted();
   const { fileOrBlob } = await assetCreationSource(input, options.signal);
   options.signal?.throwIfAborted();
+  await options.prepareUploadDispatch?.();
+  if (options.signal?.aborted)
+    throw new DOMException('Asset creation was cancelled.', 'AbortError');
   options.onUploadDispatch?.();
 
   const uploadRequest = client.uploads.createFromFileOrBlob({

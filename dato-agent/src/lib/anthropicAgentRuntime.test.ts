@@ -46,6 +46,7 @@ import {
   DATO_SCRIPT_OUTCOME_MARKER_PREFIX,
   type DatoScriptOutcomeV1,
 } from './datoScriptOutcome';
+import { DatoMcpAuthenticationError } from './mcpAuthentication';
 
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
 
@@ -1292,7 +1293,7 @@ describe('AnthropicAgentRuntime', () => {
     );
     expect(request?.system).toContain('WRITABLE MODE');
     expect(request?.system).toContain(
-      'overrides any earlier user, assistant, or tool message that says Read Only is enabled or writing tools are unavailable',
+      "Plugin restrictions, OAuth access, and the account's project role all apply",
     );
     expect((request?.tools ?? []).map((tool) => tool.name)).toContain(
       'upsert_and_execute_unsafe_script',
@@ -4186,5 +4187,138 @@ describe('AnthropicAgentRuntime', () => {
     await runtime.dispose?.();
 
     expect(mcp.close).toHaveBeenCalledOnce();
+  });
+});
+
+describe('Anthropic MCP authentication and access', () => {
+  it.each([
+    'content_view_only',
+    'unknown',
+    'content_only',
+    'unrestricted',
+  ] as const)('applies OAuth %s to tools and local uploads', async (level) => {
+    for (const readOnly of [false, true]) {
+      const client = new QueueAnthropicClient([
+        message('access', [textBlock('Ready')]),
+      ]);
+      const sdk = mcpClientWith();
+      // biome-ignore lint/performance/noAwaitInLoops: Each permission case has its own runtime and isolated assertions.
+      await runtimeWith(client, sdk.client, {
+        readOnly,
+        mcpAccessLevel: level,
+        createDatoAsset: vi.fn(),
+      }).runTurn({ message: 'Read' });
+      const request = client.requests[0];
+      const writable =
+        !readOnly && (level === 'content_only' || level === 'unrestricted');
+      expect(
+        JSON.stringify(request.tools).includes(
+          'upsert_and_execute_unsafe_script',
+        ),
+      ).toBe(writable);
+      expect(JSON.stringify(request.tools).includes('create_dato_asset')).toBe(
+        writable,
+      );
+      expect(JSON.stringify(request.tools)).toContain(
+        'upsert_and_execute_safe_script',
+      );
+      expect(JSON.stringify(request.system)).toContain(level);
+    }
+  });
+
+  it.each(['http', 'metadata'])(
+    'stops safe tool dispatch after %s authentication failure',
+    async (kind) => {
+      const client = new QueueAnthropicClient([
+        message(
+          'read',
+          [toolUse('read-1', 'whoami', {}), toolUse('read-2', 'whoami', {})],
+          'tool_use',
+        ),
+      ]);
+      const sdk = mcpClientWith(async () => {
+        if (kind === 'http') throw new DatoMcpAuthenticationError();
+        return {
+          content: 'Please authenticate',
+          isError: true,
+          authenticationRequired: true,
+        };
+      });
+      const result = await runtimeWith(client, sdk.client).runTurn({
+        message: 'Read',
+      });
+      expect(result.error).toMatchObject({
+        code: 'mcp_auth_required',
+        retryable: false,
+      });
+      expect(sdk.callTool).toHaveBeenCalledTimes(1);
+      expect(client.requests).toHaveLength(1);
+    },
+  );
+
+  it('rechecks cancellation after awaited write access and before the journal guard', async () => {
+    const args = unsafeScriptInput();
+    const client = new QueueAnthropicClient([
+      message(
+        'write',
+        [toolUse('write-1', 'upsert_and_execute_unsafe_script', args)],
+        'tool_use',
+      ),
+    ]);
+    const sdk = mcpClientWith();
+    const runtime = runtimeWith(client, sdk.client);
+    const proposal = await runtime.runTurn({ message: 'Update' });
+    const controller = new AbortController();
+    const beforeDispatch = vi.fn();
+    const result = await runtime.submitApprovals({
+      responseId: proposal.responseId ?? '',
+      decisions: [{ approvalRequestId: 'write-1', approve: true }],
+      signal: controller.signal,
+      unsafeDispatchCallbacks: {
+        prepareDispatch: async () => {
+          controller.abort();
+        },
+        beforeDispatch,
+      },
+    });
+    expect(sdk.callTool).not.toHaveBeenCalled();
+    expect(beforeDispatch).not.toHaveBeenCalled();
+    expect(result.error?.code).toBe('aborted');
+  });
+
+  it('retains an uncertain unsafe result on authentication loss and does not repeat it', async () => {
+    const client = new QueueAnthropicClient([
+      message(
+        'write',
+        [
+          toolUse(
+            'write-1',
+            'upsert_and_execute_unsafe_script',
+            unsafeScriptInput(),
+          ),
+        ],
+        'tool_use',
+      ),
+    ]);
+    const sdk = mcpClientWith(async () => ({
+      content: 'Authenticate again',
+      isError: true,
+      authenticationRequired: true,
+    }));
+    const runtime = runtimeWith(client, sdk.client);
+    const proposal = await runtime.runTurn({ message: 'Update' });
+    const args = {
+      responseId: proposal.responseId ?? '',
+      decisions: [{ approvalRequestId: 'write-1', approve: true }],
+      unsafeDispatchCallbacks: { beforeDispatch: vi.fn() },
+    };
+    const result = await runtime.submitApprovals(args);
+    expect(result.error).toMatchObject({
+      code: 'unsafe_outcome_unknown',
+      mcpAuthRequired: true,
+      retryable: false,
+    });
+    await runtime.submitApprovals(args);
+    expect(sdk.callTool).toHaveBeenCalledOnce();
   });
 });

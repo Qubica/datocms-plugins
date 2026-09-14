@@ -67,6 +67,7 @@ describe('registerClient', () => {
 
     expect(client).toEqual({
       clientId: 'mcp_public_client',
+      registrationVersion: 2,
       clientIdIssuedAt: 123,
       redirectUri: 'https://plugin.example/callback',
     });
@@ -134,6 +135,8 @@ describe('authorization request and token exchange', () => {
 
     const [, tokenInit] = fetchMock.mock.calls[0];
     const body = new URLSearchParams(String(tokenInit?.body));
+    expect(url.searchParams.get('resource')).toBe(MCP_BASE_URL);
+    expect(body.get('resource')).toBe(MCP_BASE_URL);
     const verifier = body.get('code_verifier');
     expect(verifier).toHaveLength(43);
     const expectedChallenge = await sha256Base64Url(String(verifier));
@@ -264,15 +267,11 @@ describe('OAuth popup callback', () => {
 
   it('posts callback data only to the callback origin', () => {
     const postMessage = vi.fn();
-    const close = vi.fn();
-    const schedule = vi.fn((callback: () => void) => callback());
 
     expect(
       postOAuthCallbackToOpener({
         url: 'https://plugin.example/callback?code=abc&state=state',
         opener: { postMessage },
-        close,
-        schedule,
       }),
     ).toBe(true);
 
@@ -283,7 +282,6 @@ describe('OAuth popup callback', () => {
       },
       'https://plugin.example',
     );
-    expect(close).toHaveBeenCalledOnce();
   });
 
   it('opens a blank popup synchronously', () => {
@@ -384,5 +382,54 @@ describe('revokeToken', () => {
         client_id: 'mcp_public_client',
       },
     );
+  });
+});
+
+describe('OAuth error recovery contracts', () => {
+  it.each(['invalid_client', 'invalid_grant'])(
+    'preserves %s without reusing its consumed code',
+    async (code) => {
+      sessionStorage.clear();
+      const request = await createAuthorizationRequest({
+        scope,
+        clientId: 'client',
+        redirectUri: 'https://plugin.example/callback',
+      });
+      const fetchMock = vi
+        .fn<FetchFunction>()
+        .mockResolvedValue(
+          Response.json(
+            { error: code, error_description: 'private server data' },
+            { status: 400 },
+          ),
+        );
+      const args = { scope, code: 'single-use', state: request.state };
+      await expect(
+        exchangeAuthorizationCode(args, { fetch: fetchMock }),
+      ).rejects.toMatchObject({ code });
+      await expect(
+        exchangeAuthorizationCode(args, { fetch: fetchMock }),
+      ).rejects.toThrow();
+      expect(fetchMock).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('keeps the callback popup open when the opener must finish token exchange', async () => {
+    const popup = { closed: false, close: vi.fn() } as unknown as Window;
+    const pending = waitForOAuthCallback(popup, 'state', {
+      closeOnSuccess: false,
+    });
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        origin: window.location.origin,
+        source: popup,
+        data: {
+          type: OAUTH_POPUP_MESSAGE_TYPE,
+          callback: { ok: true, code: 'code', state: 'state' },
+        },
+      }),
+    );
+    await expect(pending).resolves.toEqual({ code: 'code', state: 'state' });
+    expect(popup.close).not.toHaveBeenCalled();
   });
 });
