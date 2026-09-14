@@ -2,37 +2,52 @@ import { faSearch } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import type { RenderFieldExtensionCtx } from 'datocms-plugin-sdk';
 import { Button, useCtx } from 'datocms-react-ui';
-import type { Product } from '../../utils/ShopifyClient';
+import type { SelectionKind } from '../../utils/fieldParameters';
+import type { Product, ProductVariant } from '../../utils/ShopifyClient';
 import s from './styles.module.css';
 
 export type EmptyProps = {
-  onSelect: (product: Product) => void;
+  selection: SelectionKind;
+  onSelect: (picked: Product | ProductVariant) => void;
 };
 
-export default function Empty({ onSelect }: EmptyProps) {
+const LABELS: Record<SelectionKind, { empty: string; browse: string }> = {
+  product: {
+    empty: 'No product selected!',
+    browse: 'Browse Shopify products',
+  },
+  variant: {
+    empty: 'No product variant selected!',
+    browse: 'Browse Shopify product variants',
+  },
+};
+
+export default function Empty({ selection, onSelect }: EmptyProps) {
   const ctx = useCtx<RenderFieldExtensionCtx>();
+  const labels = LABELS[selection];
 
   const handleOpenModal = async () => {
-    const product = (await ctx.openModal({
+    const picked = (await ctx.openModal({
       id: 'browseProducts',
-      title: 'Browse Shopify products',
+      title: labels.browse,
       width: 'xl',
-    })) as Product | null;
+      parameters: { selection },
+    })) as Product | ProductVariant | null;
 
-    if (product) {
-      onSelect(product);
+    if (picked) {
+      onSelect(picked);
     }
   };
 
   return (
     <div className={s.empty}>
-      <div className={s.empty__label}>No product selected!</div>
+      <div className={s.empty__label}>{labels.empty}</div>
       <Button
         onClick={handleOpenModal}
         buttonSize="s"
         leftIcon={<FontAwesomeIcon icon={faSearch} />}
       >
-        Browse Shopify products
+        {labels.browse}
       </Button>
     </div>
   );

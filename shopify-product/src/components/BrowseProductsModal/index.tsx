@@ -6,11 +6,19 @@ import { Button, Canvas, Spinner, TextInput } from 'datocms-react-ui';
 import { type FormEvent, useEffect, useMemo, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { getShopifyClientConfig, parseAndNormalizeConfig } from '../../types';
+import { isSelectionKind } from '../../utils/fieldParameters';
 import ShopifyClient, { type Product } from '../../utils/ShopifyClient';
 import useStore, { type State } from '../../utils/useStore';
+import ProductVariants from './ProductVariants';
 import s from './styles.module.css';
 
 export default function BrowseProductsModal({ ctx }: { ctx: RenderModalCtx }) {
+  // In variant mode a product click reveals its variants instead of
+  // resolving the modal right away.
+  const pickVariants = isSelectionKind(ctx.parameters.selection)
+    ? ctx.parameters.selection === 'variant'
+    : false;
+
   const performSearch = useStore(
     (state) => (state as State).fetchProductsMatching,
   );
@@ -38,6 +46,7 @@ export default function BrowseProductsModal({ ctx }: { ctx: RenderModalCtx }) {
   );
 
   const [sku, setSku] = useState<string>('');
+  const [expandedProduct, setExpandedProduct] = useState<Product | null>(null);
 
   const { storefrontAccessToken, shopifyDomain } = getShopifyClientConfig(
     parseAndNormalizeConfig(ctx.plugin.attributes.parameters),
@@ -53,7 +62,16 @@ export default function BrowseProductsModal({ ctx }: { ctx: RenderModalCtx }) {
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
+    setExpandedProduct(null);
     performSearch(client, sku);
+  };
+
+  const handleProductClick = (product: Product) => {
+    if (pickVariants) {
+      setExpandedProduct(product);
+    } else {
+      ctx.resolve(product);
+    }
   };
 
   return (
@@ -80,37 +98,51 @@ export default function BrowseProductsModal({ ctx }: { ctx: RenderModalCtx }) {
           </Button>
         </form>
         <div className={s.container}>
-          {!!products?.length && (
-            <div
-              className={classNames(s.products, {
-                [s.products__loading]: status === 'loading',
-              })}
-            >
-              {products.map((product: Product) => (
-                <button
-                  key={product.handle}
-                  onClick={() => ctx.resolve(product)}
-                  className={s.product}
+          {pickVariants && expandedProduct ? (
+            <ProductVariants
+              client={client}
+              product={expandedProduct}
+              onBack={() => setExpandedProduct(null)}
+              onSelect={(variant) => ctx.resolve(variant)}
+            />
+          ) : (
+            <>
+              {!!products?.length && (
+                <div
+                  className={classNames(s.products, {
+                    [s.products__loading]: status === 'loading',
+                  })}
                 >
-                  <div
-                    className={s.product__image}
-                    style={{
-                      backgroundImage: `url(${product.previewImageUrl || product.imageUrl})`,
-                    }}
-                  />
-                  <div className={s.product__content}>
-                    <div className={s.product__title}>{product.title}</div>
-                  </div>
-                </button>
-              ))}
-            </div>
-          )}
-          {status === 'loading' && <Spinner size={25} placement="centered" />}
-          {status === 'success' && products && products.length === 0 && (
-            <div className={s.empty}>No products found!</div>
-          )}
-          {status === 'error' && (
-            <div className={s.empty}>API call failed!</div>
+                  {products.map((product: Product) => (
+                    <button
+                      type="button"
+                      key={product.handle}
+                      onClick={() => handleProductClick(product)}
+                      className={s.product}
+                    >
+                      <div
+                        className={s.product__image}
+                        style={{
+                          backgroundImage: `url(${product.previewImageUrl || product.imageUrl})`,
+                        }}
+                      />
+                      <div className={s.product__content}>
+                        <div className={s.product__title}>{product.title}</div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+              {status === 'loading' && (
+                <Spinner size={25} placement="centered" />
+              )}
+              {status === 'success' && products && products.length === 0 && (
+                <div className={s.empty}>No products found!</div>
+              )}
+              {status === 'error' && (
+                <div className={s.empty}>API call failed!</div>
+              )}
+            </>
           )}
         </div>
       </div>

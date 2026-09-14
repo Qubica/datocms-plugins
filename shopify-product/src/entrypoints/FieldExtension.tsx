@@ -3,36 +3,48 @@ import { Canvas } from 'datocms-react-ui';
 import get from 'lodash-es/get';
 import Empty from '../components/Empty';
 import Value from '../components/Value';
-import type { Product } from '../utils/ShopifyClient';
+import {
+  type FieldParameters,
+  normalizeFieldParameters,
+} from '../utils/fieldParameters';
+import {
+  isProductVariant,
+  type Product,
+  type ProductVariant,
+} from '../utils/ShopifyClient';
+import { selectionFromFieldValue, toNumericId } from '../utils/shopifyIds';
 
 type PropTypes = {
   ctx: RenderFieldExtensionCtx;
 };
 
-export default function FieldExtension({ ctx }: PropTypes) {
-  const fieldType = ctx.field.attributes.field_type;
-
-  const rawValue = get(ctx.formValues, ctx.fieldPath) as string;
-
-  let shopifyHandle: string | undefined;
-
-  switch (fieldType) {
-    case 'json':
-      shopifyHandle = rawValue && JSON.parse(rawValue).handle;
-      break;
-    case 'string':
-      shopifyHandle = rawValue;
-      break;
-
-    default:
-      break;
+/** Value written to the field for the picked product or variant. */
+function fieldValueFor(
+  picked: Product | ProductVariant,
+  fieldType: string,
+  params: FieldParameters,
+): string {
+  if (fieldType === 'json') {
+    return JSON.stringify(picked);
   }
 
-  const handleSelect = (product: Product) => {
-    ctx.setFieldValue(
-      ctx.fieldPath,
-      fieldType === 'json' ? JSON.stringify(product) : product.handle,
-    );
+  if (isProductVariant(picked)) {
+    return toNumericId(picked.id);
+  }
+
+  return params.productStringValue === 'id'
+    ? toNumericId(picked.id)
+    : picked.handle;
+}
+
+export default function FieldExtension({ ctx }: PropTypes) {
+  const fieldType = ctx.field.attributes.field_type;
+  const params = normalizeFieldParameters(ctx.parameters);
+  const rawValue = get(ctx.formValues, ctx.fieldPath);
+  const selection = selectionFromFieldValue(rawValue, fieldType, params);
+
+  const handleSelect = (picked: Product | ProductVariant) => {
+    ctx.setFieldValue(ctx.fieldPath, fieldValueFor(picked, fieldType, params));
   };
 
   const handleReset = () => {
@@ -41,10 +53,10 @@ export default function FieldExtension({ ctx }: PropTypes) {
 
   return (
     <Canvas ctx={ctx}>
-      {shopifyHandle ? (
-        <Value value={shopifyHandle} onReset={handleReset} />
+      {selection ? (
+        <Value selection={selection} onReset={handleReset} />
       ) : (
-        <Empty onSelect={handleSelect} />
+        <Empty selection={params.selection} onSelect={handleSelect} />
       )}
     </Canvas>
   );

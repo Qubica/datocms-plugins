@@ -90,3 +90,21 @@
 .reset:hover {
   opacity: 0.8;
 }
+
+.product__variant {
+  font-size: 0.9em;
+  margin-bottom: 5px;
+}
+
+.product__variant_unavailable {
+  color: var(--color--ink-subtle);
+}
+
+.product__variant_option {
+  display: inline-block;
+  margin-left: var(--spacing-s);
+  padding: 0 6px;
+  border-radius: 3px;
+  background-color: var(--color--surface-muted);
+  color: var(--color--ink-subtle);
+}

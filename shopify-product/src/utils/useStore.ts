@@ -1,11 +1,15 @@
 /**
  * Zustand store for Shopify product data.
  *
- * This store manages two normalized caches, both persisted to localStorage:
+ * This store manages three normalized caches, all persisted to localStorage:
  *
- * - `products`  — keyed by product handle, caches individual Product objects
- *                 and their fetch status. Shared between the browse modal and
+ * - `products`  — caches individual Product objects and their fetch status.
+ *                 Keyed by product handle (search results and handle lookups)
+ *                 or by `id:<numeric id>` for lookups by product ID, see
+ *                 `productLookupCacheKey`. Shared between the browse modal and
  *                 the field value display.
+ * - `variants`  — keyed by numeric variant ID, caches ProductVariant objects
+ *                 (each carrying its parent product) and fetch status.
  * - `searches`  — keyed by search query string, caches the list of matching
  *                 product handles (not full objects) and fetch status.
  *
@@ -26,7 +30,8 @@ import { produce } from 'immer';
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type ShopifyClient from './ShopifyClient';
-import type { Product } from './ShopifyClient';
+import type { Product, ProductVariant } from './ShopifyClient';
+import { type ProductLookup, productLookupCacheKey } from './shopifyIds';
 
 export type Status = 'loading' | 'success' | 'error';
 
@@ -37,20 +42,35 @@ export type State = {
   /** Normalized cache of search results, keyed by query string. */
   searches: Record<string, { result: string[] | null; status: Status }>;
 
-  /** Normalized cache of individual products, keyed by handle. */
+  /** Normalized cache of individual products, see `productLookupCacheKey`. */
   products: Record<string, { result: Product | null; status: Status }>;
+
+  /** Normalized cache of individual variants, keyed by numeric variant ID. */
+  variants: Record<string, { result: ProductVariant | null; status: Status }>;
 
   /**
    * Derives a single product's data and fetch status from the cache.
    * Returns a new object — wrap with `useShallow` when used as a selector.
    */
-  getProduct(handle: string): {
+  getProduct(key: string): {
     status: Status;
     product: Product | null;
   };
 
-  /** Fetches a single product by its Shopify handle and caches the result. */
-  fetchProductByHandle(client: ShopifyClient, handle: string): Promise<void>;
+  /**
+   * Derives a single variant's data and fetch status from the cache.
+   * Returns a new object — wrap with `useShallow` when used as a selector.
+   */
+  getVariant(id: string): {
+    status: Status;
+    variant: ProductVariant | null;
+  };
+
+  /** Fetches a single product by handle or ID and caches the result. */
+  fetchProduct(client: ShopifyClient, lookup: ProductLookup): Promise<void>;
+
+  /** Fetches a single variant by its numeric ID and caches the result. */
+  fetchVariant(client: ShopifyClient, id: string): Promise<void>;
 
   /** Searches for products matching a query string and caches the results. */
   fetchProductsMatching(client: ShopifyClient, query: string): Promise<void>;
@@ -68,10 +88,11 @@ const useStore = create(
       return {
         query: '',
         products: {},
+        variants: {},
         searches: {},
 
-        getProduct(handle: string) {
-          const selectedProduct = (get() as State).products[handle];
+        getProduct(key: string) {
+          const selectedProduct = (get() as State).products[key];
 
           return {
             status: selectedProduct?.status
@@ -81,23 +102,60 @@ const useStore = create(
           };
         },
 
-        async fetchProductByHandle(client: ShopifyClient, handle: string) {
+        getVariant(id: string) {
+          const selectedVariant = (get() as State).variants[id];
+
+          return {
+            status: selectedVariant?.status
+              ? selectedVariant.status
+              : 'loading',
+            variant: selectedVariant?.result,
+          };
+        },
+
+        async fetchProduct(client: ShopifyClient, lookup: ProductLookup) {
+          const key = productLookupCacheKey(lookup);
+
           set((state) => {
-            state.products[handle] = state.products[handle] || { result: null };
-            state.products[handle].status = 'loading';
+            state.products[key] = state.products[key] || { result: null };
+            state.products[key].status = 'loading';
           });
 
           try {
-            const product = await client.productByHandle(handle);
+            const product =
+              lookup.by === 'id'
+                ? await client.productById(lookup.value)
+                : await client.productByHandle(lookup.value);
 
             set((state) => {
-              state.products[handle].result = product;
-              state.products[handle].status = 'success';
+              state.products[key].result = product;
+              state.products[key].status = 'success';
             });
           } catch (_e) {
             set((state) => {
-              state.products[handle].result = null;
-              state.products[handle].status = 'error';
+              state.products[key].result = null;
+              state.products[key].status = 'error';
+            });
+          }
+        },
+
+        async fetchVariant(client: ShopifyClient, id: string) {
+          set((state) => {
+            state.variants[id] = state.variants[id] || { result: null };
+            state.variants[id].status = 'loading';
+          });
+
+          try {
+            const variant = await client.variantById(id);
+
+            set((state) => {
+              state.variants[id].result = variant;
+              state.variants[id].status = 'success';
+            });
+          } catch (_e) {
+            set((state) => {
+              state.variants[id].result = null;
+              state.variants[id].status = 'error';
             });
           }
         },

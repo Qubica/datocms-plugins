@@ -5,6 +5,7 @@ import {
   FieldGroup,
   Form,
   Section,
+  SelectField,
   SwitchField,
   TextField,
 } from 'datocms-react-ui';
@@ -14,6 +15,12 @@ import {
   parseAndNormalizeConfig,
   type ValidConfig,
 } from '../types';
+import {
+  findOption,
+  isOption,
+  PRODUCT_STRING_VALUE_OPTIONS,
+  SELECTION_OPTIONS,
+} from '../utils/selectOptions';
 import ShopifyClient from '../utils/ShopifyClient';
 import s from './styles.module.css';
 
@@ -93,9 +100,8 @@ export default function ConfigScreen({ ctx }: Props) {
                         label="Shop ID"
                         hint={
                           <>
-                            If your shop is{' '}
-                            <code>foo-bar.myshopify.com</code>, then insert{' '}
-                            <code>foo-bar</code>
+                            If your shop is <code>foo-bar.myshopify.com</code>,
+                            then insert <code>foo-bar</code>
                           </>
                         }
                         placeholder="my-shop"
@@ -104,7 +110,8 @@ export default function ConfigScreen({ ctx }: Props) {
                         {...input}
                       />
                     )}
-                  </Field>)}
+                  </Field>
+                )}
                 {!values.useDemoStore && (
                   <Field name="storefrontAccessToken">
                     {({ input, meta: { error } }) => (
@@ -137,19 +144,66 @@ export default function ConfigScreen({ ctx }: Props) {
               </FieldGroup>
             </Section>
             <Section title="Auto-apply to fields">
-              <Field name="autoApplyToFieldsWithApiKey">
-                {({ input, meta: { error } }) => (
-                  <TextField
-                    id="autoApplyToFieldsWithApiKey"
-                    label="Auto-apply this plugin to all Single-line and JSON fields fields matching the following API identifier:"
-                    hint="A regular expression can be used"
-                    placeholder="shopify_product"
-                    error={error}
-                    textInputProps={{ monospaced: true }}
-                    {...input}
-                  />
+              <FieldGroup>
+                <Field name="autoApplyToFieldsWithApiKey">
+                  {({ input, meta: { error } }) => (
+                    <TextField
+                      id="autoApplyToFieldsWithApiKey"
+                      label="Auto-apply this plugin to all Single-line and JSON fields matching the following API identifier:"
+                      hint="A regular expression can be used"
+                      placeholder="shopify_product"
+                      error={error}
+                      textInputProps={{ monospaced: true }}
+                      {...input}
+                    />
+                  )}
+                </Field>
+                <Field name="defaultSelection">
+                  {({ input }) => (
+                    <SelectField
+                      id="defaultSelection"
+                      name={input.name}
+                      label="Auto-applied fields let editors pick"
+                      hint="Fields where the plugin is installed manually have their own setting in the field's editor configuration."
+                      value={findOption(SELECTION_OPTIONS, input.value)}
+                      onChange={(option) => {
+                        if (isOption(option)) {
+                          input.onChange(option.value);
+                        }
+                      }}
+                      selectInputProps={{
+                        isMulti: false,
+                        options: SELECTION_OPTIONS,
+                      }}
+                    />
+                  )}
+                </Field>
+                {values.defaultSelection === 'product' && (
+                  <Field name="defaultProductStringValue">
+                    {({ input }) => (
+                      <SelectField
+                        id="defaultProductStringValue"
+                        name={input.name}
+                        label="Auto-applied single-line fields store"
+                        hint="The product ID is the numeric part of the Shopify GID (the gid://shopify/Product/ prefix is stripped). Variants always store the numeric variant ID; JSON fields store the full object."
+                        value={findOption(
+                          PRODUCT_STRING_VALUE_OPTIONS,
+                          input.value,
+                        )}
+                        onChange={(option) => {
+                          if (isOption(option)) {
+                            input.onChange(option.value);
+                          }
+                        }}
+                        selectInputProps={{
+                          isMulti: false,
+                          options: PRODUCT_STRING_VALUE_OPTIONS,
+                        }}
+                      />
+                    )}
+                  </Field>
                 )}
-              </Field>
+              </FieldGroup>
             </Section>
             <Button
               type="submit"
