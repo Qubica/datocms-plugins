@@ -1,25 +1,38 @@
-import {
-  faExternalLinkAlt,
-  faTimesCircle,
-} from '@fortawesome/free-solid-svg-icons';
+import { faTimesCircle } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import classNames from 'classnames';
 import type { RenderFieldExtensionCtx } from 'datocms-plugin-sdk';
 import { useCtx } from 'datocms-react-ui';
 import { useEffect, useMemo } from 'react';
-import { useShallow } from 'zustand/react/shallow';
 import { getShopifyClientConfig, parseAndNormalizeConfig } from '../../types';
-import ShopifyClient from '../../utils/ShopifyClient';
-import useStore, { type State } from '../../utils/useStore';
-import Price from '../Price';
+import ShopifyClient, {
+  isProductVariant,
+  type Product,
+  type ProductVariant,
+} from '../../utils/ShopifyClient';
+import { type FieldSelection, selectionKey } from '../../utils/shopifyIds';
+import useStore, { LOADING_ENTRY } from '../../utils/useStore';
+import ProductCard from './ProductCard';
 import s from './styles.module.css';
 
 export type ValueProps = {
-  value: string;
+  /** Memoized by the caller: the effect below refetches when it changes. */
+  selection: FieldSelection;
   onReset: () => void;
 };
 
-export default function Value({ value, onReset }: ValueProps) {
+/** Splits a cached entry into the product to show and the variant, if any. */
+function splitResult(result: Product | ProductVariant | null) {
+  if (!result) {
+    return { product: null, variant: null };
+  }
+
+  return isProductVariant(result)
+    ? { product: result.product, variant: result }
+    : { product: result, variant: null };
+}
+
+export default function Value({ selection, onReset }: ValueProps) {
   const ctx = useCtx<RenderFieldExtensionCtx>();
 
   const { storefrontAccessToken, shopifyDomain } = getShopifyClientConfig(
@@ -31,19 +44,19 @@ export default function Value({ value, onReset }: ValueProps) {
     [storefrontAccessToken, shopifyDomain],
   );
 
-  // getProduct() returns a new object each call; useShallow prevents
-  // infinite re-renders by comparing { status, product } shallowly.
-  const { product, status } = useStore(
-    useShallow((state) => (state as State).getProduct(value)),
+  const key = selectionKey(selection);
+  const { result, status } = useStore(
+    (state) => state.products[key] ?? LOADING_ENTRY,
   );
-
-  const fetchProductByHandle = useStore(
-    (state) => (state as State).fetchProductByHandle,
-  );
+  const fetchSelection = useStore((state) => state.fetchSelection);
 
   useEffect(() => {
-    fetchProductByHandle(client, value);
-  }, [client, value, fetchProductByHandle]);
+    fetchSelection(client, selection);
+  }, [client, selection, fetchSelection]);
+
+  const { product, variant } = splitResult(result);
+  const storedValue =
+    selection.kind === 'variant' ? selection.id : selection.lookup.value;
 
   return (
     <div
@@ -53,55 +66,12 @@ export default function Value({ value, onReset }: ValueProps) {
     >
       {status === 'error' && (
         <div className={s.product}>
-          API Error! Could not fetch details for product:&nbsp;
-          <code>{value}</code>
+          API Error! Could not fetch details for{' '}
+          {selection.kind === 'variant' ? 'product variant' : 'product'}:&nbsp;
+          <code>{storedValue}</code>
         </div>
       )}
-      {product && (
-        <div className={s.product}>
-          <div
-            className={s.product__image}
-            style={{
-              backgroundImage: `url(${product.previewImageUrl || product.imageUrl})`,
-            }}
-          />
-          <div className={s.product__info}>
-            <div className={s.product__title}>
-              <a
-                href={product.onlineStoreUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                {product.title}
-              </a>
-              <FontAwesomeIcon icon={faExternalLinkAlt} />
-            </div>
-            <div className={s.product__description}>{product.description}</div>
-            {product.productType && (
-              <div className={s.product__producttype}>
-                <strong>Product type:</strong>
-                &nbsp;
-                {product.productType}
-              </div>
-            )}
-
-            <div className={s.product__price}>
-              <strong>Price:</strong>
-              &nbsp;
-              {product.priceRange.maxVariantPrice.amount !==
-              product.priceRange.minVariantPrice.amount ? (
-                <span>
-                  <Price {...product.priceRange.minVariantPrice} />
-                  &nbsp; - &nbsp;
-                  <Price {...product.priceRange.maxVariantPrice} />
-                </span>
-              ) : (
-                <Price {...product.priceRange.maxVariantPrice} />
-              )}
-            </div>
-          </div>
-        </div>
-      )}
+      {product && <ProductCard product={product} variant={variant} />}
       <button type="button" onClick={onReset} className={s.reset}>
         <FontAwesomeIcon icon={faTimesCircle} />
       </button>

@@ -1,4 +1,5 @@
 import type { ValidConfig } from '../types';
+import { toProductGid, toVariantGid } from './shopifyIds';
 
 export type Product = {
   id: string;
@@ -28,9 +29,55 @@ export type PriceTypes = {
   currencyCode: string;
 };
 
+export type SelectedOption = {
+  name: string;
+  value: string;
+};
+
+/** A product variant together with the product it belongs to. */
+export type ProductVariant = {
+  id: string;
+  title: string;
+  sku: string | null;
+  availableForSale: boolean;
+  selectedOptions: SelectedOption[];
+  price: PriceTypes;
+  imageUrl: string;
+  product: Product;
+};
+
 export type Products = {
   edges: [{ node: Product }];
 };
+
+/** Narrows a picked object: variants carry their parent `product`. */
+export function isProductVariant(
+  picked: Product | ProductVariant,
+): picked is ProductVariant {
+  return 'product' in picked;
+}
+
+/**
+ * Labels describing a variant beyond its title: its options (Shopify's
+ * placeholder "Title: Default Title" option is skipped), SKU and availability.
+ */
+export function variantMeta(variant: ProductVariant): string[] {
+  const labels = variant.selectedOptions
+    .filter(
+      (option) => option.name !== 'Title' || option.value !== 'Default Title',
+    )
+    .map((option) => `${option.name}: ${option.value}`);
+
+  if (variant.sku) {
+    labels.push(`SKU: ${variant.sku}`);
+  }
+
+  if (!variant.availableForSale) {
+    labels.push('Unavailable');
+  }
+
+  return labels;
+}
 
 const productFragment = `
   id
@@ -60,14 +107,39 @@ const productFragment = `
   }
 `;
 
+const variantFragment = `
+  id
+  title
+  sku
+  availableForSale
+  selectedOptions {
+    name
+    value
+  }
+  price {
+    amount
+    currencyCode
+  }
+  image {
+    url
+  }
+`;
+
+/** Shopify lists at most this many variants per product in the browse modal. */
+export const MAX_VARIANTS_PER_PRODUCT = 100;
+
 type RawProductNode = Omit<Product, 'imageUrl' | 'previewImageUrl'> & {
   images: {
     edges: Array<{ node: { src: string; previewSrc: string } }>;
   };
 };
 
-type RawProductsResponse = {
-  edges: Array<{ node: RawProductNode }>;
+type RawVariantNode = Omit<ProductVariant, 'imageUrl' | 'product'> & {
+  image: { url: string } | null;
+};
+
+type RawEdges<Node> = {
+  edges: Array<{ node: Node }>;
 };
 
 const normalizeProduct = (product: RawProductNode): Product => {
@@ -85,8 +157,29 @@ const normalizeProduct = (product: RawProductNode): Product => {
   };
 };
 
-const normalizeProducts = (products: RawProductsResponse): Product[] =>
+const normalizeProducts = (products: RawEdges<RawProductNode>): Product[] =>
   products.edges.map((edge) => normalizeProduct(edge.node));
+
+const normalizeVariant = (
+  variant: RawVariantNode | null,
+  product: Product,
+): ProductVariant => {
+  if (
+    !variant ||
+    typeof variant !== 'object' ||
+    typeof variant.id !== 'string'
+  ) {
+    throw new Error('Invalid variant');
+  }
+
+  const { image, ...rest } = variant;
+
+  return {
+    ...rest,
+    imageUrl: image?.url || product.previewImageUrl || product.imageUrl,
+    product,
+  };
+};
 
 export default class ShopifyClient {
   storefrontAccessToken: string;
@@ -100,7 +193,7 @@ export default class ShopifyClient {
     this.shopifyDomain = shopifyDomain;
   }
 
-  async productsMatching(query: string) {
+  async productsMatching(query: string): Promise<Product[]> {
     const response = await this.fetch({
       query: `
         query getProducts($query: String) {
@@ -118,7 +211,7 @@ export default class ShopifyClient {
     return normalizeProducts(response.products);
   }
 
-  async productByHandle(handle: string) {
+  async productByHandle(handle: string): Promise<Product> {
     const response = await this.fetch({
       query: `
         query getProduct($handle: String!) {
@@ -131,6 +224,83 @@ export default class ShopifyClient {
     });
 
     return normalizeProduct(response.product);
+  }
+
+  /** Looks a product up by its numeric ID or full `gid://shopify/Product/…`. */
+  async productById(id: string): Promise<Product> {
+    const response = await this.fetch({
+      query: `
+        query getProductById($id: ID!) {
+          product(id: $id) {
+            ${productFragment}
+          }
+        }
+      `,
+      variables: { id: toProductGid(id) },
+    });
+
+    return normalizeProduct(response.product);
+  }
+
+  /** Lists the first `MAX_VARIANTS_PER_PRODUCT` variants of a product. */
+  async variantsOfProduct(product: Product): Promise<ProductVariant[]> {
+    const response = await this.fetch({
+      query: `
+        query getProductVariants($handle: String!, $first: Int!) {
+          product: productByHandle(handle: $handle) {
+            variants(first: $first) {
+              edges {
+                node {
+                  ${variantFragment}
+                }
+              }
+            }
+          }
+        }
+      `,
+      variables: { handle: product.handle, first: MAX_VARIANTS_PER_PRODUCT },
+    });
+
+    const variants = response.product?.variants as
+      | RawEdges<RawVariantNode>
+      | undefined;
+
+    if (!variants) {
+      throw new Error('Invalid product');
+    }
+
+    return variants.edges.map((edge) => normalizeVariant(edge.node, product));
+  }
+
+  /** Looks a variant up by its numeric ID or full `gid://shopify/ProductVariant/…`. */
+  async variantById(id: string): Promise<ProductVariant> {
+    const response = await this.fetch({
+      query: `
+        query getVariant($id: ID!) {
+          node(id: $id) {
+            ... on ProductVariant {
+              ${variantFragment}
+              product {
+                ${productFragment}
+              }
+            }
+          }
+        }
+      `,
+      variables: { id: toVariantGid(id) },
+    });
+
+    const node = response.node as
+      | (RawVariantNode & { product: RawProductNode })
+      | null;
+
+    if (!node || typeof node.id !== 'string') {
+      throw new Error('Invalid variant');
+    }
+
+    const { product, ...rawVariant } = node;
+
+    return normalizeVariant(rawVariant, normalizeProduct(product));
   }
 
   async fetch(requestBody: {

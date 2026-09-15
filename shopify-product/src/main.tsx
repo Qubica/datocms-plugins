@@ -5,6 +5,7 @@ import {
 } from 'datocms-plugin-sdk';
 import BrowseProductsModal from './components/BrowseProductsModal';
 import ConfigScreen from './entrypoints/ConfigScreen';
+import FieldConfigScreen from './entrypoints/FieldConfigScreen';
 import FieldExtension from './entrypoints/FieldExtension';
 import { render } from './utils/render';
 import 'datocms-react-ui/styles.css';
@@ -13,6 +14,10 @@ import {
   isValidConfig,
   parseAndNormalizeConfig,
 } from './types';
+import {
+  type FieldParameters,
+  validateFieldParameters,
+} from './utils/fieldParameters';
 
 const FIELD_EXTENSION_ID = 'shopifyProduct';
 
@@ -81,8 +86,19 @@ connect({
         name: 'Shopify Product',
         type: 'editor',
         fieldTypes: ['string', 'json'],
+        configurable: { initialHeight: 220 },
       },
     ];
+  },
+  validateManualFieldExtensionParameters(_fieldExtensionId, parameters) {
+    return validateFieldParameters(parameters);
+  },
+  renderManualFieldExtensionConfigScreen(fieldExtensionId, ctx) {
+    switch (fieldExtensionId) {
+      case FIELD_EXTENSION_ID:
+        render(<FieldConfigScreen ctx={ctx} />);
+        break;
+    }
   },
   overrideFieldExtensions(field, ctx) {
     const config = parseAndNormalizeConfig(ctx.plugin.attributes.parameters);
@@ -100,8 +116,14 @@ connect({
       return;
     }
 
+    const parameters: FieldParameters = {
+      paramsVersion: '1',
+      selection: config.defaultSelection,
+      productStringValue: config.defaultProductStringValue,
+    };
+
     return {
-      editor: { id: FIELD_EXTENSION_ID },
+      editor: { id: FIELD_EXTENSION_ID, parameters },
     };
   },
   renderFieldExtension(_id, ctx) {

@@ -8,10 +8,20 @@
  *
  * Config history:
  * - v1 (LegacyConfig): only shopifyDomain + storefrontAccessToken
- * - v2 (ValidConfig): adds paramsVersion discriminant,
- *   autoApplyToFieldsWithApiKey, and useDemoStore
+ * - v2: adds paramsVersion discriminant, autoApplyToFieldsWithApiKey, and
+ *   useDemoStore
+ * - v3 (ValidConfig): adds defaultSelection and defaultProductStringValue,
+ *   the field parameters given to fields the plugin auto-applies to
  * - FirstInstallationParameters: empty object before the user configures anything
  */
+
+import {
+  DEFAULT_FIELD_PARAMETERS,
+  isProductStringValue,
+  isSelectionKind,
+  type ProductStringValue,
+  type SelectionKind,
+} from './utils/fieldParameters';
 
 /** Empty parameters before the user has saved any configuration. */
 export type FirstInstallationParameters = Record<string, never>;
@@ -42,16 +52,20 @@ export const DEMO_SHOPIFY_CONFIG = {
   storefrontAccessToken: '6f39fb123179b7d636d84d833d3d3adf',
 } satisfies Pick<ValidConfig, 'shopifyDomain' | 'storefrontAccessToken'>;
 
-/** Current config schema (v2). */
+/** Current config schema (v3). */
 export type ValidConfig = {
   shopifyDomain: string;
   storefrontAccessToken: string;
   autoApplyToFieldsWithApiKey: string;
   useDemoStore: boolean;
-  paramsVersion: '2';
+  /** Field parameters applied to auto-applied fields: what editors pick. */
+  defaultSelection: SelectionKind;
+  /** Field parameters applied to auto-applied fields: value stored for products. */
+  defaultProductStringValue: ProductStringValue;
+  paramsVersion: '3';
 };
 
-/** Pre-v2 config that lacks one or more current config fields. */
+/** Pre-v3 config that lacks one or more current config fields. */
 export type LegacyConfig = {
   shopifyDomain: string;
   storefrontAccessToken: string;
@@ -62,7 +76,7 @@ export type Config = ValidConfig | LegacyConfig | FirstInstallationParameters;
 
 /**
  * Runtime type guard that checks whether untyped SDK parameters are already a
- * fully valid v2 config. Used in `onBoot` to skip migration when unnecessary.
+ * fully valid v3 config. Used in `onBoot` to skip migration when unnecessary.
  */
 export function isValidConfig(
   params: Record<string, unknown>,
@@ -70,11 +84,13 @@ export function isValidConfig(
   return (
     params != null &&
     typeof params === 'object' &&
-    params.paramsVersion === '2' &&
+    params.paramsVersion === '3' &&
     typeof params.shopifyDomain === 'string' &&
     typeof params.storefrontAccessToken === 'string' &&
     typeof params.autoApplyToFieldsWithApiKey === 'string' &&
-    typeof params.useDemoStore === 'boolean'
+    typeof params.useDemoStore === 'boolean' &&
+    isSelectionKind(params.defaultSelection) &&
+    isProductStringValue(params.defaultProductStringValue)
   );
 }
 
@@ -94,9 +110,9 @@ export function isConfigComplete(config: ValidConfig): boolean {
  * Validates and migrates untyped SDK parameters into a `ValidConfig`.
  *
  * Handles three cases:
- * 1. Already a valid v2 config — returned as-is.
- * 2. Legacy config — carries over shopifyDomain/storefrontAccessToken,
- *    fills in new fields with defaults.
+ * 1. Already a valid v3 config — returned as-is.
+ * 2. Legacy (v1/v2) config — carries over every known field, fills in new
+ *    fields with defaults.
  * 3. Empty/unknown shape (fresh install or corrupted data) — returns a
  *    blank config with all string fields defaulting to `''`.
  */
@@ -108,7 +124,7 @@ export function parseAndNormalizeConfig(
   }
 
   return {
-    paramsVersion: '2',
+    paramsVersion: '3',
     storefrontAccessToken:
       typeof raw.storefrontAccessToken === 'string'
         ? raw.storefrontAccessToken
@@ -121,6 +137,14 @@ export function parseAndNormalizeConfig(
         : '',
     useDemoStore:
       typeof raw.useDemoStore === 'boolean' ? raw.useDemoStore : false,
+    defaultSelection: isSelectionKind(raw.defaultSelection)
+      ? raw.defaultSelection
+      : DEFAULT_FIELD_PARAMETERS.selection,
+    defaultProductStringValue: isProductStringValue(
+      raw.defaultProductStringValue,
+    )
+      ? raw.defaultProductStringValue
+      : DEFAULT_FIELD_PARAMETERS.productStringValue,
   };
 }
 
